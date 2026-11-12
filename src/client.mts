@@ -22,20 +22,50 @@ export class RequestError extends Error {
   }
 }
 
-export const REQUEST_TIMEOUT_MS = 30_000;
+// Chrome can stop an MV3 service worker after about 30 s without an extension
+// call, so a request allowed 30 s could outlive the worker that made it.
+export const REQUEST_TIMEOUT_MS = 20_000;
 
 export interface ClientOptions {
   readonly token: string;
   readonly fetch?: (url: string, init: RequestInit) => Promise<Response>;
   readonly timeoutMs?: number;
+  // A cheap extension call, made before each request and not waited on, so a
+  // request never adds its own length to a stretch without one.
+  readonly keepAlive?: () => unknown;
+  readonly log?: (line: string) => void;
 }
 
-export function createClient({ token, fetch: send = (url, init) => fetch(url, init), timeoutMs = REQUEST_TIMEOUT_MS }: ClientOptions): Client {
+const nameOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
+const defaultLog = (line: string) => console.log(`[rex-spider-chatgpt] ${line}`);
+
+// Makes the keep-alive call without waiting on it: the call resets the idle
+// timer when it is made, and one that never answers must hold nothing up. One
+// that throws or rejects is logged by its error's name only, and ignored.
+function touch(keepAlive: () => unknown, log: (line: string) => void): void {
+  const failed = (error: unknown) => {
+    try {
+      log(`keep-alive failed (${nameOf(error)})`);
+    } catch {
+      // A log that throws has nowhere left to report to.
+    }
+  };
+  try {
+    Promise.resolve(keepAlive()).catch(failed);
+  } catch (error) {
+    failed(error);
+  }
+}
+
+export function createClient({ token, fetch: send = (url, init) => fetch(url, init), timeoutMs = REQUEST_TIMEOUT_MS, keepAlive, log = defaultLog }: ClientOptions): Client {
   // Only the Authorization header and no credentials option, as the spider's
   // list calls have always been made.
   const headers = { Authorization: `Bearer ${token}` };
   return {
     async get(url) {
+      if (keepAlive !== undefined) {
+        touch(keepAlive, log);
+      }
       const controller = new AbortController();
       // Raced against the request and the body read, so the timeout holds even
       // where an abort does not reach them (a body that never finishes).

@@ -109,8 +109,10 @@ test('get answers any status with its headers (lower-cased) and its body, and do
   assert.equal(classify(got), 'rate-limited');
 });
 
-test('requests time out after 30 s unless told otherwise', () => {
-  assert.equal(REQUEST_TIMEOUT_MS, 30_000);
+// Under the service worker's idle limit of about 30 s, so a request cannot
+// outlive the worker that made it.
+test('requests time out after 20 s unless told otherwise', () => {
+  assert.equal(REQUEST_TIMEOUT_MS, 20_000);
 });
 
 test('a request with no answer within the timeout is aborted and throws a timeout', { timeout: 2000 }, async () => {
@@ -138,7 +140,7 @@ test('a body that never finishes is cut at the same timeout', { timeout: 2000 },
   await assert.rejects(client.get('https://chatgpt.com/x'), (error: unknown) => error instanceof RequestError && error.kind === 'timeout');
 });
 
-test('a client made without a timeout aborts at 30 s, not before', { timeout: 2000 }, async (t) => {
+test('a client made without a timeout aborts at 20 s, not before', { timeout: 2000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const client = createClient({ token: 'T', fetch: () => new Promise(() => {}) });
   let settled = false;
@@ -152,13 +154,68 @@ test('a client made without a timeout aborts at 30 s, not before', { timeout: 20
       return error instanceof RequestError ? error.kind : 'other';
     },
   );
-  t.mock.timers.tick(29_999);
+  t.mock.timers.tick(19_999);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, false, 'ended before 30 s');
+  assert.equal(settled, false, 'ended before 20 s');
   t.mock.timers.tick(1);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, true, 'still waiting at 30 s');
+  assert.equal(settled, true, 'still waiting at 20 s');
   assert.equal(await outcome, 'timeout');
+});
+
+// The keep-alive is a cheap extension call that resets the worker's idle
+// timer when it is made. It is not waited on: one that never answers must hold
+// nothing up.
+test('each request makes one keep-alive call, before the fetch, and does not wait on it', { timeout: 2000 }, async () => {
+  const events: string[] = [];
+  const client = createClient({
+    token: 'T',
+    keepAlive: () => {
+      events.push('keep-alive');
+      return new Promise(() => {});
+    },
+    fetch: async (url) => {
+      events.push(`fetch ${url}`);
+      return new Response('{}');
+    },
+  });
+  await client.get('https://chatgpt.com/a');
+  await client.get('https://chatgpt.com/b');
+  assert.deepEqual(events, ['keep-alive', 'fetch https://chatgpt.com/a', 'keep-alive', 'fetch https://chatgpt.com/b']);
+});
+
+test('a keep-alive that throws or rejects does not break the request, and only its error name is logged', async () => {
+  const failing: [() => unknown, string][] = [
+    [() => {
+      throw new TypeError('SECRET-TITLE no storage');
+    }, 'keep-alive failed (TypeError)'],
+    [() => Promise.reject(new RangeError('SECRET-TITLE gone')), 'keep-alive failed (RangeError)'],
+  ];
+  for (const [keepAlive, expected] of failing) {
+    const lines: string[] = [];
+    const client = createClient({ token: 'T', keepAlive, log: (line) => lines.push(line), fetch: respond(() => new Response('{"items":[]}')) });
+    const got = await client.get('https://chatgpt.com/x');
+    assert.deepEqual({ status: got.status, text: got.text }, { status: 200, text: '{"items":[]}' });
+    // A rejection is handled a turn later.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(lines, [expected]);
+  }
+});
+
+test('without a log, a failed keep-alive is printed with the module prefix', async (t) => {
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  const client = createClient({
+    token: 'T',
+    keepAlive: () => {
+      throw new TypeError('SECRET-TITLE');
+    },
+    fetch: respond(() => new Response('{}')),
+  });
+  await client.get('https://chatgpt.com/x');
+  assert.deepEqual(printed, ['[rex-spider-chatgpt] keep-alive failed (TypeError)']);
 });
 
 test('a request that answered leaves no timer behind to abort its signal later', async (t) => {
