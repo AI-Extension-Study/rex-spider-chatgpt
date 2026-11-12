@@ -1,17 +1,21 @@
 {
   "compilerOptions": {
     "module": "NodeNext",
-    "target": "es6",
-    "esModuleInterop": true,
     "moduleResolution": "nodenext",
-    "sourceMap": true,
-    "rootDir": "src",
-    "outDir": "dist",
-    "types": ["chrome-types"],
-    "lib": ["es2015", "es2016", "es2021", "dom"],
-    "skipLibCheck": true
+    "target": "es2022",
+    "lib": ["es2022", "dom"],
+    "types": ["chrome-types", "node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    // The unit tests run the .mts sources under Node, which strips types, so
+    // only syntax stripping can remove is allowed (no enums, namespaces or
+    // parameter properties), and imports name the .mts file as Node needs it.
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    // tsc only type-checks. The extension's build compiles the source itself,
+    // and the package's exports point at src/.
+    "noEmit": true
   },
-  "include": [
-    "src/**/*"
-  ],
+  "include": ["src/**/*", "tests/unit/**/*"]
 }

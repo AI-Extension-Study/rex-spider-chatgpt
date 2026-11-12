@@ -23,21 +23,28 @@
         "./service-worker": "./src/service-worker.mts",
         "./spider": "./src/spider.mts"
     },
+    "engines": {
+        "node": ">=24.11"
+    },
     "scripts": {
         "build": "tsc",
-        "lint": "eslint src",
-        "pretest": "node tests/scripts/build-test-bundle.js",
-        "test": "playwright test",
-        "test:ci": "playwright test --reporter=dot",
+        "lint": "eslint src tests/unit tests/strip-node-modules-types.mjs",
+        "test": "npm run test:unit && npm run test:specs",
+        "test:unit": "node --disable-warning=ExperimentalWarning --import ./tests/strip-node-modules-types.mjs --test --test-timeout=60000 'tests/unit/**/*.test.mts'",
+        "pretest:specs": "node tests/scripts/build-test-bundle.js",
+        "test:specs": "playwright test",
+        "test:ci": "npm run test:unit && npm run pretest:specs && playwright test --reporter=dot",
         "test:debug": "playwright test --debug",
         "test:headed": "playwright test --headed",
-        "test:ui": "playwright test --ui",
-        "test:unit": "playwright test specs/"
+        "test:ui": "playwright test --ui"
     },
     "dependencies": {
         "@bric/rex-core": "github:bric-digital/rex-core",
         "@bric/rex-spider": "github:bric-digital/rex-spider",
         "@bric/rex-types": "github:bric-digital/rex-types",
         "@types/bootstrap": "^5.2.11"
+    },
+    "devDependencies": {
+        "@types/node": "^24.19.2"
     }
 }
