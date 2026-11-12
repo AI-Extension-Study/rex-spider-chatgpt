@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { memoKey } from '../../src/keys.mts';
+import { resendSince } from '../../src/mode.mts';
 import { type HandleMessage, STORE_DEADLINE_MS, createStore } from '../../src/store.mts';
 
 type Message = { messageType: string; key: string; value?: unknown };
@@ -79,6 +80,23 @@ test('a read that gets no answer within the deadline counts as absent and is fla
   const silent = (() => true) as unknown as HandleMessage;
   const store = createStore(silent, { deadlineMs: 20, log: quiet });
   assert.deepEqual(await store.get('k'), { value: null, unanswered: true });
+});
+
+test('a read that never gets an answer stays flagged through the mode and memo reads, and resendSince writes nothing after it', { timeout: 2000 }, async () => {
+  // Taken (true) or not handled (false), the message is never answered.
+  for (const handled of [true, false]) {
+    const asked: string[] = [];
+    const silent = ((message: Message) => {
+      asked.push(`${message.messageType} ${message.key}`);
+      return handled;
+    }) as unknown as HandleMessage;
+    const store = createStore(silent, { deadlineMs: 20, log: quiet });
+    assert.deepEqual(await store.mode.get(), { value: null, unanswered: true, malformed: false }, `handled: ${handled}`);
+    assert.deepEqual(await store.memo.get(CHAT), { value: null, unanswered: true, malformed: false }, `handled: ${handled}`);
+    asked.length = 0;
+    assert.equal(await resendSince(store, 'detail', 1700000000000), null, `handled: ${handled}`);
+    assert.deepEqual(asked, ['fetchValue rex-spider-chatgpt-mode'], `handled: ${handled}`);
+  }
 });
 
 test('an answer that comes after the deadline is ignored', { timeout: 2000 }, async () => {

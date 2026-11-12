@@ -37,7 +37,12 @@ export async function resendSince(store: Pick<ChatGPTStore, 'mode'>, served: Mod
   return written.ok ? now : null;
 }
 
-// rex-spider's checkIfAlreadyTransmitted, or a test's stand-in.
+// The upload-key lookup the caller hands in: rex-spider's
+// checkIfAlreadyTransmitted behind a deadline, or a test's stand-in. Not the
+// bare call, which never settles while rex-core's database is not open
+// (rex-core answers no read then). At the deadline the lookup should reject:
+// an answer of false would read as never sent, and the chat would go out
+// again.
 export type Transmitted = (id: string, ended: DateString) => Promise<boolean>;
 
 // Whether a chat in the crawl window needs nothing this pass: it was sent in
