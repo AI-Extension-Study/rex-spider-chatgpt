@@ -19,10 +19,10 @@ export const MAX_PAGES = 1000;
 // projects would multiply that.
 export const MAX_REQUESTS = 5000;
 
-// A conversation list whose pages bring no chat it had not given, this many
-// in a row, is cut: its paging is not moving on. One such page can be
-// ordinary (chats that move up between two calls shift a page), so it takes
-// three.
+// A list of chats (main, archived, starred or a project) whose pages bring no
+// chat it had not given, this many in a row, is cut: its paging is not moving
+// on. One such page can be ordinary (chats that move up between two calls
+// shift a page), so it takes three.
 export const STALE_PAGES = 3;
 
 // The spider's own default, used when the served crawl_delay is unreadable:
@@ -30,6 +30,31 @@ export const STALE_PAGES = 3;
 export const DEFAULT_CRAWL_DELAY_MS = 30_000;
 
 export type Source = 'main' | 'archived' | 'starred' | 'project';
+
+// A chat that several lists name is taken from the list ranked first here,
+// whatever order they are walked in, so it gets the upload key the spider
+// could already have stored for it. The spider has always read the main list
+// and the projects. Its main query leaves out archived and starred chats, so
+// for one of those inside a project only the project path's key can exist.
+const RANK: Readonly<Record<Source, number>> = { main: 0, project: 1, archived: 2, starred: 3 };
+
+// The list keys a summary record's metadata is built from, and the only ones
+// kept from a list item (the design's allow-list). Each is in its form or
+// null: the times as ISO instants as the list sent them, is_starred true or
+// null (a list sends null, never false, for a chat that is not starred), the
+// flags as booleans, and memory_scope and async_status as type names.
+export interface ListMeta {
+  readonly create_time: string | null;
+  // Always set on a listed chat, which needs a readable update_time.
+  readonly update_time: string | null;
+  readonly is_archived: boolean | null;
+  readonly is_starred: true | null;
+  readonly pinned_time: string | null;
+  readonly is_temporary_chat: boolean | null;
+  readonly is_do_not_remember: boolean | null;
+  readonly memory_scope: string | null;
+  readonly async_status: string | null;
+}
 
 export interface ListItem {
   readonly id: string;
@@ -45,8 +70,14 @@ export interface ListItem {
   // The list's update_time, read from its ISO string with its microseconds on
   // every source. uploadTime is what the upload key uses.
   readonly updated: DateString;
-  // The first list the chat was seen on: main, archived, starred, project.
+  // The list the item was read from: of the lists that name the chat, the
+  // first in RANK (main, project, archived, starred).
   readonly source: Source;
+  readonly meta: ListMeta;
+  // gizmo_id and conversation_template_id, a non-empty string or null, for
+  // the hashes the summary carries. Never sent as they are.
+  readonly gizmoId: string | null;
+  readonly templateId: string | null;
 }
 
 // Epoch milliseconds, as rex-spider's crawlWindowContains reads them; null is
@@ -72,8 +103,9 @@ export interface WalkOptions {
 export type WalkOutcome = 'whole' | 'partial' | 'failed';
 
 export interface WalkResult {
-  // Each chat in the crawl window once, main list first, then archived, then
-  // starred, then the projects, each list newest first.
+  // Each chat in the crawl window once, in the order first seen (main, then
+  // archived, then starred, then the projects, each list newest first). A
+  // chat seen again on a list of higher RANK takes that list's item in place.
   readonly items: ListItem[];
   // whole: every list was read to its end and every chat was readable.
   // failed: an answer that was rate-limited, challenged or signed-out stopped
@@ -135,6 +167,33 @@ function instant(value: unknown): DateString | null {
   return read.value === null ? null : read;
 }
 
+// The forms of ListMeta. A time is kept as the list sent it when the walk can
+// read it as an instant, by the reader updated and started use (the shape
+// alone lets a 13th month through, and Date.parse takes 30 February). A type
+// name is lowercase letters, digits, _, . and -, at most 64 characters.
+const TYPE_NAME = /^[a-z0-9_.-]{1,64}$/;
+const isoTime = (value: unknown): string | null => (typeof value === 'string' && instant(value) !== null ? value : null);
+const typeName = (value: unknown): string | null => (typeof value === 'string' && TYPE_NAME.test(value) ? value : null);
+const flag = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
+const idText = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null);
+
+// Only the allow-list, key by key. Nothing is copied from the list item as a
+// whole: a project item also carries a text snippet and its owner's address
+// and name.
+function readMeta(fields: Record<string, unknown>): ListMeta {
+  return {
+    create_time: isoTime(fields.create_time),
+    update_time: isoTime(fields.update_time),
+    is_archived: flag(fields.is_archived),
+    is_starred: fields.is_starred === true ? true : null,
+    pinned_time: isoTime(fields.pinned_time),
+    is_temporary_chat: flag(fields.is_temporary_chat),
+    is_do_not_remember: flag(fields.is_do_not_remember),
+    memory_scope: typeName(fields.memory_scope),
+    async_status: typeName(fields.async_status),
+  };
+}
+
 // A chat is read only with an id and an update_time; one without is skipped
 // and counted (the answer says which), so the walk says it was partial and the
 // chat is not guessed at. A create_time that cannot be read only gives a null
@@ -143,7 +202,8 @@ function readItem(raw: unknown, source: Source): ListItem | 'no-id' | 'no-update
   if (typeof raw !== 'object' || raw === null) {
     return 'no-id';
   }
-  const { id, title, create_time: createdAt, update_time: updatedAt } = raw as Record<string, unknown>;
+  const fields = raw as Record<string, unknown>;
+  const { id, title, create_time: createdAt, update_time: updatedAt } = fields;
   if (typeof id !== 'string' || id === '') {
     return 'no-id';
   }
@@ -158,7 +218,16 @@ function readItem(raw: unknown, source: Source): ListItem | 'no-id' | 'no-update
   } else {
     started = instant(createdAt);
   }
-  return { id, title: typeof title === 'string' ? title : null, started, updated, source };
+  return {
+    id,
+    title: typeof title === 'string' ? title : null,
+    started,
+    updated,
+    source,
+    meta: readMeta(fields),
+    gizmoId: idText(fields.gizmo_id),
+    templateId: idText(fields.conversation_template_id),
+  };
 }
 
 // The time the upload key is built from, as the spider has always built it on
@@ -231,9 +300,9 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   };
 
   // Reads a page's chats into the items, counting what it cannot read. Returns
-  // how many were new to the list (when `seen` tracks it) and how many were in
-  // the window.
-  const take = (list: unknown[], source: Source, seen: Set<string> | null) => {
+  // how many were new to the list (`seen` holds the ids it gave before) and
+  // how many were in the window.
+  const take = (list: unknown[], source: Source, seen: Set<string>) => {
     let fresh = 0;
     let inside = 0;
     let unreadable = 0;
@@ -248,13 +317,14 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
         }
         continue;
       }
-      if (seen !== null && !seen.has(item.id)) {
+      if (!seen.has(item.id)) {
         seen.add(item.id);
         fresh += 1;
       }
       if (inWindow(window, item.updated.timestamp())) {
         inside += 1;
-        if (!items.has(item.id)) {
+        const held = items.get(item.id);
+        if (held === undefined || RANK[item.source] < RANK[held.source]) {
           items.set(item.id, item);
         }
       }
@@ -394,11 +464,15 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
     }
   }
 
-  // A project's chats, by cursor from 0, until the cursor is null or missing or
-  // a page has no items. The window does not stop it, as before. It is a
-  // safety net: the capture found every project chat on the main list too.
+  // A project's chats, by cursor from 0. It stops as the conversation lists
+  // do, on an empty page, a page with nothing in the window, or pages that
+  // bring nothing new, and also on a cursor that is null, missing or '' or
+  // comes back. It is a safety net: the capture found every project chat on
+  // the main list too.
   async function walkProject(projectId: string): Promise<Failure | null> {
     const cursors = new Set<string>();
+    const seen = new Set<string>();
+    let stale = 0;
     let cursor = '0';
     for (let pages = 0; ; pages += 1) {
       if (pages >= maxPages) {
@@ -417,7 +491,15 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
       if (list.length === 0) {
         return null;
       }
-      take(list, 'project', null);
+      const { fresh, inside } = take(list, 'project', seen);
+      if (inside === 0) {
+        return null;
+      }
+      stale = fresh === 0 ? stale + 1 : 0;
+      if (stale >= STALE_PAGES) {
+        cut('not-moving', 'project');
+        return null;
+      }
       const next = nextCursor(got.body.cursor);
       if (next === undefined) {
         return ended('project', pages + 1, badPage);

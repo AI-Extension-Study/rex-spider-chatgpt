@@ -298,7 +298,7 @@ test('a list never pages by total, which is not a count', async () => {
   assert.deepEqual(other.urls.slice(0, 2), [MAIN(0), ARCHIVED(0)]);
 });
 
-test('each chat is returned once, with the first source it was seen on: main, then archived, then starred, then project', async () => {
+test('each chat is returned once, from the highest-ranked list that names it: main, then project, then archived, then starred', async () => {
   const fake = run({
     [MAIN(0)]: page([entry(1), entry(2), entry(3), entry(4)]),
     [MAIN(28)]: empty(),
@@ -307,18 +307,45 @@ test('each chat is returned once, with the first source it was seen on: main, th
     [STARRED(0)]: page([entry(3), entry(6), entry(7)]),
     [STARRED(28)]: empty(),
     [SIDEBAR]: json(sidebarOf(P1)),
-    [PROJECT(P1, '0')]: projectPage([projectEntry(4), projectEntry(7), projectEntry(8)], null),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(4), projectEntry(5), projectEntry(7), projectEntry(8)], null),
   });
   const result = await fake.result;
+  // In the order first seen; a later list of higher rank replaces the item in place.
   assert.deepEqual(
     result.items.map((item) => [item.id, item.source]),
     [
       [chatId(1), 'main'], [chatId(2), 'main'], [chatId(3), 'main'], [chatId(4), 'main'],
-      [chatId(5), 'archived'], [chatId(6), 'archived'],
-      [chatId(7), 'starred'],
+      [chatId(5), 'project'], [chatId(6), 'archived'],
+      [chatId(7), 'project'],
       [chatId(8), 'project'],
     ],
   );
+});
+
+// The spider's main query leaves out starred and archived chats, so the only
+// key it could have stored for one inside a project is the project path's.
+test('a starred or archived chat that a project also lists takes the project path, the only key the spider could have stored for it', async () => {
+  const updateTime = '2026-09-08T13:48:43.781456Z';
+  const createTime = '2026-09-08T13:47:43.781456Z';
+  const projectStarted = new DateString(Date.parse(createTime) / 1000);
+  assert.notEqual(JSON.stringify(projectStarted), JSON.stringify(new DateString(createTime)), 'both paths give the same started here, so this proves nothing about started');
+  for (const [list, url] of [['starred', STARRED], ['archived', ARCHIVED]] as const) {
+    const fake = run({
+      ...NOTHING,
+      [url(0)]: page([{ ...entry(1), update_time: updateTime, create_time: createTime }]),
+      [url(28)]: empty(),
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(1), update_time: updateTime, create_time: createTime }], null),
+    });
+    const result = await fake.result;
+    assert.equal(result.items.length, 1, list);
+    const [item] = result.items;
+    // Today's project path: Date.parse gives 1788875323781, and the key time is ...780.
+    assert.equal(uploadTime(item).timestamp(), 1788875323780, list);
+    assert.equal(JSON.stringify(uploadTime(item)), JSON.stringify(new DateString(Date.parse(updateTime) / 1000)), list);
+    assert.equal(JSON.stringify(item.started), JSON.stringify(projectStarted), list);
+    assert.equal(item.source, 'project', list);
+  }
 });
 
 test('a chat repeated on a later page of the same list is returned once, as first seen', async () => {
@@ -327,11 +354,11 @@ test('a chat repeated on a later page of the same list is returned once, as firs
   assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
 });
 
-test('a list item holds the id, the title, the creation and update times, and the source, and nothing else', async () => {
+test('a list item holds the id, the title, the creation and update times, the source, the summary keys and the two ids to hash, and nothing else', async () => {
   const fake = run({ ...NOTHING, [MAIN(0)]: page([entry(1, T0), { ...entry(2, T0 - 1000), title: null }, { ...entry(3, T0 - 2000), title: 42, create_time: null }]), [MAIN(28)]: empty() });
   const result = await fake.result;
   const [one, two, three] = result.items;
-  assert.deepEqual(Object.keys(one).sort(), ['id', 'source', 'started', 'title', 'updated']);
+  assert.deepEqual(Object.keys(one).sort(), ['gizmoId', 'id', 'meta', 'source', 'started', 'templateId', 'title', 'updated']);
   assert.equal(one.id, chatId(1));
   assert.equal(one.title, 'SECRET-TITLE-1');
   assert.equal(one.started?.timestamp(), T0 - 60_000);
@@ -340,6 +367,173 @@ test('a list item holds the id, the title, the creation and update times, and th
   assert.equal(two.title, null);
   assert.equal(three.title, null);
   assert.equal(three.started, null);
+});
+
+// The summary record's metadata allow-list (the design's records table).
+const META_KEYS = ['async_status', 'create_time', 'is_archived', 'is_do_not_remember', 'is_starred', 'is_temporary_chat', 'memory_scope', 'pinned_time', 'update_time'];
+
+test('meta holds the nine allow-listed list keys, each as the list sent it when it has its form', async () => {
+  const starred = {
+    ...entry(1, T0),
+    is_archived: false,
+    is_starred: true,
+    pinned_time: '2026-09-01T10:00:00.000000Z',
+    is_temporary_chat: false,
+    is_do_not_remember: true,
+    memory_scope: 'global_enabled',
+    async_status: 'v2.done-1',
+  };
+  // A project item as the capture saw one: is_temporary_chat null, no pin, no memory keys.
+  const inProject = { ...projectEntry(2, T0 - 1000), is_archived: true, is_temporary_chat: null, pinned_time: null };
+  const fake = run({
+    ...NOTHING,
+    [STARRED(0)]: page([starred]),
+    [STARRED(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([inProject], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(result.items.map((item) => item.source), ['starred', 'project']);
+  assert.deepEqual(result.items[0].meta, {
+    create_time: '2026-09-08T13:48:43.781123Z',
+    update_time: iso(T0, '456'),
+    is_archived: false,
+    is_starred: true,
+    pinned_time: '2026-09-01T10:00:00.000000Z',
+    is_temporary_chat: false,
+    is_do_not_remember: true,
+    memory_scope: 'global_enabled',
+    async_status: 'v2.done-1',
+  });
+  assert.deepEqual(result.items[1].meta, {
+    create_time: iso(T0 - 1000 - 60_000, '123'),
+    update_time: iso(T0 - 1000, '456'),
+    is_archived: true,
+    is_starred: null,
+    pinned_time: null,
+    is_temporary_chat: null,
+    is_do_not_remember: null,
+    memory_scope: null,
+    async_status: null,
+  });
+});
+
+test('a meta value not in its form is null: booleans, is_starred true only, times by the ISO shape, type names by their pattern', async (t) => {
+  // DateString prints a time of the right shape that it cannot read, which is
+  // digits and punctuation only; keep it out of the test output, and check it.
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  const bad: [string, unknown][] = [
+    ['is_archived', 'false'], ['is_archived', 0], ['is_archived', 'SECRET-TITLE'], ['is_archived', {}],
+    ['is_starred', false], ['is_starred', 'true'], ['is_starred', 1],
+    ['is_temporary_chat', 'yes'], ['is_do_not_remember', 0],
+    ['create_time', 1788875323.781], ['create_time', '2026-09-08'], ['create_time', 'SECRET-TITLE'], ['create_time', '2026-13-08T13:48:43Z'],
+    // Date.parse reads these two, but the instant reader the walk uses for started and updated does not.
+    ['create_time', '2026-02-30T13:48:43Z'], ['pinned_time', '2026-09-08T24:00:00Z'],
+    ['pinned_time', 1788875323.781], ['pinned_time', '2026-09-08T13:48:43Z SECRET-TITLE'], ['pinned_time', ''], ['pinned_time', '2026-09-08 13:48:43'],
+    ['memory_scope', 'Global'], ['memory_scope', 'SECRET-TITLE'], ['memory_scope', 'two words'], ['memory_scope', 'x'.repeat(65)], ['memory_scope', ''], ['memory_scope', 5],
+    ['async_status', 'SECRET-TITLE'], ['async_status', 'done!'], ['async_status', ['done']],
+  ];
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page(bad.map(([key, value], k) => ({ ...entry(k + 1), [key]: value }))),
+    [MAIN(28)]: empty(),
+  });
+  const result = await fake.result;
+  assert.equal(result.items.length, bad.length);
+  for (const [k, [key, value]] of bad.entries()) {
+    const meta = result.items[k].meta as unknown as Record<string, unknown>;
+    assert.equal(meta[key], null, `${key} ${JSON.stringify(value)}`);
+    // meta keeps a create_time exactly when started can read it.
+    assert.equal(meta.create_time === null, result.items[k].started === null, `create_time and started disagree on ${key} ${JSON.stringify(value)}`);
+  }
+  // and the edges that are in form
+  const edge = run({
+    ...NOTHING,
+    [MAIN(0)]: page([{ ...entry(1), memory_scope: 'x'.repeat(64), async_status: 'a', pinned_time: '2026-09-08T13:48:43+05:30' }]),
+    [MAIN(28)]: empty(),
+  });
+  const [item] = (await edge.result).items;
+  assert.deepEqual([item.meta.memory_scope, item.meta.async_status, item.meta.pinned_time], ['x'.repeat(64), 'a', '2026-09-08T13:48:43+05:30']);
+  for (const line of [...printed, ...fake.logs, ...edge.logs]) {
+    assert.ok(!line.includes('SECRET'), `"${line}" shows a marker`);
+  }
+});
+
+test('a list item missing every optional key has each in meta as null', async () => {
+  const fake = run({ ...NOTHING, [MAIN(0)]: page([{ id: chatId(1), update_time: iso(T0, '456') }]), [MAIN(28)]: empty() });
+  const [item] = (await fake.result).items;
+  assert.deepEqual(item.meta, {
+    create_time: null,
+    update_time: iso(T0, '456'),
+    is_archived: null,
+    is_starred: null,
+    pinned_time: null,
+    is_temporary_chat: null,
+    is_do_not_remember: null,
+    memory_scope: null,
+    async_status: null,
+  });
+  assert.deepEqual([item.title, item.started, item.gizmoId, item.templateId], [null, null, null, null]);
+});
+
+test('gizmoId and templateId are gizmo_id and conversation_template_id when they are strings, else null', async () => {
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([
+      { ...entry(1), gizmo_id: null, conversation_template_id: null },
+      { ...entry(2), gizmo_id: 'g-abc', conversation_template_id: 'g-def' },
+      { ...entry(3), gizmo_id: '', conversation_template_id: 7 },
+      { ...entry(4), gizmo_id: { id: 'g-abc' }, conversation_template_id: ['g-def'] },
+    ]),
+    [MAIN(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(5), gizmo_id: P1, conversation_template_id: P2 }], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(
+    result.items.map((item) => [item.gizmoId, item.templateId]),
+    [[null, null], ['g-abc', 'g-def'], [null, null], [null, null], [P1, P2]],
+  );
+});
+
+test('nothing but the allow-list reaches a list item: no owner, snippet, URL list or workspace of a project item', async () => {
+  const markers = ['MARKER-EMAIL@example.org', 'MARKER-NAME', 'https://avatar.example/MARKER-AVATAR.png', 'MARKER-SNIPPET', 'https://safe.example/MARKER-SAFE', 'https://blocked.example/MARKER-BLOCKED', 'MARKER-WORKSPACE', 'MARKER-USER-ID', 'MARKER-SUGAR', 'MARKER-NODE', 'MARKER-MAPPING', 'MARKER-SUMMARY', 'MARKER-SCOPE'];
+  const raw = (n: number) => ({
+    ...entry(n),
+    title: 'a title',
+    gizmo_id: P1,
+    conversation_template_id: P1,
+    owner: { user_email: markers[0], name: markers[1], avatar_url: markers[2], user_id: markers[7] },
+    snippet: markers[3],
+    safe_urls: [markers[4]],
+    blocked_urls: [markers[5]],
+    workspace_id: markers[6],
+    sugar_item_id: markers[8],
+    current_node: markers[9],
+    mapping: { [markers[10]]: { id: markers[10] } },
+    summary_metadata: { text: markers[11] },
+    context_scopes: [markers[12]],
+  });
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([raw(1)]),
+    [MAIN(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([raw(2)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(result.items.map((item) => item.source), ['main', 'project']);
+  for (const item of result.items) {
+    assert.deepEqual(Object.keys(item.meta).sort(), META_KEYS);
+  }
+  const shown = JSON.stringify(result.items);
+  for (const marker of markers) {
+    assert.ok(!shown.includes(marker), `a list item holds ${marker}`);
+  }
+  assert.ok(!shown.includes('MARKER'));
 });
 
 test('started of a main, archived or starred chat is new DateString(create_time), with the microseconds of its ISO string', async () => {
@@ -796,6 +990,52 @@ test('a project that keeps handing out new cursors and new chats is cut at the p
   assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: page-limit' });
 });
 
+test('a project page with nothing in the window ends that project, as on the main list, and the next project is still read', async () => {
+  const old = (n: number) => projectEntry(n, BEFORE_WINDOW - n * 1000);
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    // One chat in the window is enough to go on.
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1), old(2)], 'a'),
+    [PROJECT(P1, 'a')]: projectPage([old(3), old(4)], 'b'),
+    // Never requested: the page before it had nothing in the window.
+    [PROJECT(P1, 'b')]: projectPage([projectEntry(9)], null),
+    [PROJECT(P2, '0')]: projectPage([old(5)], 'c'),
+    [PROJECT(P2, 'c')]: projectPage([projectEntry(10)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P1, 'a'), PROJECT(P2, '0')]);
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
+});
+
+test('a project whose pages bring no new chat three times in a row is cut as not moving, though its cursor keeps changing', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'c1'),
+    [PROJECT(P1, 'c1')]: projectPage([projectEntry(1)], 'c2'),
+    [PROJECT(P1, 'c2')]: projectPage([projectEntry(1)], 'c3'),
+    [PROJECT(P1, 'c3')]: projectPage([projectEntry(1)], 'c4'),
+    [PROJECT(P1, 'c4')]: projectPage([projectEntry(1)], 'c5'),
+    // A page that repeats a chat is ordinary, as on the main list, and a page
+    // with a new chat starts the count again: 'f' and 'g' are two in a row.
+    [PROJECT(P2, '0')]: projectPage([projectEntry(2)], 'd'),
+    [PROJECT(P2, 'd')]: projectPage([projectEntry(2)], 'e'),
+    [PROJECT(P2, 'e')]: projectPage([projectEntry(3)], 'f'),
+    [PROJECT(P2, 'f')]: projectPage([projectEntry(3)], 'g'),
+    [PROJECT(P2, 'g')]: projectPage([projectEntry(3)], 'h'),
+    [PROJECT(P2, 'h')]: projectPage([projectEntry(4)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [
+    PROJECT(P1, '0'), PROJECT(P1, 'c1'), PROJECT(P1, 'c2'), PROJECT(P1, 'c3'),
+    PROJECT(P2, '0'), PROJECT(P2, 'd'), PROJECT(P2, 'e'), PROJECT(P2, 'f'), PROJECT(P2, 'g'), PROJECT(P2, 'h'),
+  ]);
+  assert.deepEqual(ids(result.items), [1, 2, 3, 4].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: not-moving' });
+});
+
 test('a sidebar that keeps handing out new cursors is cut at the page limit, and the projects on the pages read are still walked', async () => {
   const fake = run({
     ...NOTHING,
@@ -820,17 +1060,22 @@ test('a list whose pages bring nothing new three times in a row is cut: its pagi
   assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason }, { ids: [chatId(1), chatId(2)], outcome: 'partial', reason: 'main: not-moving' });
 });
 
-test('one page that repeats chats is ordinary: chats move up between two calls', async () => {
+test('a page that repeats chats is ordinary (chats move up between two calls), and a page with a new chat starts the count again', async () => {
   const fake = run({
     ...NOTHING,
     [MAIN(0)]: page([entry(1), entry(2)]),
     [MAIN(28)]: page([entry(2)]),
     [MAIN(56)]: page([entry(3)]),
-    [MAIN(84)]: empty(),
+    // Two more pages with nothing new: two in a row, not three, since page 56 brought one.
+    [MAIN(84)]: page([entry(3)]),
+    [MAIN(112)]: page([entry(3)]),
+    [MAIN(140)]: page([entry(4)]),
+    [MAIN(168)]: empty(),
   });
   const result = await fake.result;
-  assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
-  assert.equal(result.outcome, 'whole');
+  assert.deepEqual(fake.urls.filter((url) => url.includes('is_archived=false')), [0, 28, 56, 84, 112, 140, 168].map(MAIN));
+  assert.deepEqual(ids(result.items), [1, 2, 3, 4].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
 });
 
 test('a project cursor that comes back again cuts that project, and the next project is still read', async () => {
