@@ -1117,7 +1117,104 @@ test('an account with nothing on any list is a whole walk of four requests', asy
   const fake = run(NOTHING);
   const result = await fake.result;
   assert.deepEqual(fake.urls, [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]);
-  assert.deepEqual(result, { items: [], outcome: 'whole', reason: 'ok' });
+  assert.deepEqual(result, { items: [], outcome: 'whole', reason: 'ok', projectsWhole: true });
+});
+
+// projectsWhole says whether the walk saw every project chat in the window.
+// When it is false, a starred or archived chat in a project the walk did not
+// finish was taken from the starred or archived list, with that path's upload
+// time in place of the project path's, and the pass holds such chats back.
+const P4 = 'g-p-0000000000000000000000000000dddd';
+
+test('projectsWhole is true when the sidebar and every project were read to their end, however each ended', async () => {
+  const old = (n: number) => projectEntry(n, BEFORE_WINDOW - n * 1000);
+  const ends: [string, Record<string, Reply>, string][] = [
+    ['no projects', NOTHING, 'ok'],
+    ['an empty page, a missing cursor, a page with nothing in the window, a null cursor, and a sidebar that ends on an empty cursor', {
+      ...NOTHING,
+      [SIDEBAR]: json({ ...sidebarOf(P1, P2), cursor: 's1' }),
+      [SIDEBAR_AT('s1')]: json({ ...sidebarOf(P3, P4), cursor: '' }),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'a'),
+      [PROJECT(P1, 'a')]: projectPage([], 'b'),
+      [PROJECT(P2, '0')]: projectPage([projectEntry(2)], undefined),
+      [PROJECT(P3, '0')]: projectPage([old(3)], 'c'),
+      [PROJECT(P4, '0')]: projectPage([projectEntry(4)], null),
+    }, 'ok'],
+    // Only the project part counts: a conversation list that failed, and
+    // chats a project lists that could not be read, leave it true.
+    ['a failed archived list, and unreadable chats in a project', {
+      ...NOTHING,
+      [ARCHIVED(0)]: json({}, 500),
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(1), update_time: 'x' }, { ...projectEntry(2), id: undefined }, projectEntry(3)], null),
+    }, 'archived: server; 1 item with no id; 1 item with an unreadable update_time'],
+  ];
+  for (const [what, table, reason] of ends) {
+    const result = await run(table).result;
+    assert.deepEqual({ what, reason: result.reason, projectsWhole: result.projectsWhole }, { what, reason, projectsWhole: true });
+  }
+});
+
+test('projectsWhole is false when the sidebar or a project failed or was cut, or the walk stopped before the projects were done', async () => {
+  const short: [string, Record<string, Reply>, { maxPages?: number; maxRequests?: number }, string][] = [
+    ['a project page that fails', {
+      ...NOTHING,
+      [SIDEBAR]: json(sidebarOf(P1, P2)),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'a'),
+      [PROJECT(P1, 'a')]: json({}, 403),
+      [PROJECT(P2, '0')]: projectPage([projectEntry(2)], null),
+    }, {}, 'project: refused'],
+    ['a project page that is no page', { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: json({ total: 3 }) }, {}, 'project: bad-page'],
+    ['a project cursor that is no cursor', { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: projectPage([projectEntry(1)], true) }, {}, 'project: bad-page'],
+    ['the sidebar failing', { ...NOTHING, [SIDEBAR]: json({}, 500) }, {}, 'sidebar: server'],
+    ['a later sidebar page failing', {
+      ...NOTHING,
+      [SIDEBAR]: json({ ...sidebarOf(P1), cursor: 's1' }),
+      [SIDEBAR_AT('s1')]: json({}, 502),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], null),
+    }, {}, 'sidebar: server'],
+    ['a sidebar cursor that is no cursor', { ...NOTHING, [SIDEBAR]: json({ ...sidebarOf(P1), cursor: {} }), [PROJECT(P1, '0')]: projectPage([projectEntry(1)], null) }, {}, 'sidebar: bad-page'],
+    ['a sidebar cursor that comes back', { ...NOTHING, [SIDEBAR]: json({ ...sidebarOf(), cursor: 'S' }), [SIDEBAR_AT('S')]: json({ ...sidebarOf(), cursor: 'S' }) }, {}, 'sidebar: not-moving'],
+    ['a sidebar cut at the page limit', {
+      ...NOTHING,
+      [SIDEBAR]: json({ ...sidebarOf(), cursor: 's1' }),
+      [SIDEBAR_AT('s1')]: json({ ...sidebarOf(), cursor: 's2' }),
+    }, { maxPages: 2 }, 'sidebar: page-limit'],
+    ['a project cut at the page limit', {
+      ...NOTHING,
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'c1'),
+      [PROJECT(P1, 'c1')]: projectPage([projectEntry(2)], 'c2'),
+    }, { maxPages: 2 }, 'project: page-limit'],
+    ['a project cursor that comes back', {
+      ...NOTHING,
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'a'),
+      [PROJECT(P1, 'a')]: projectPage([projectEntry(2)], 'a'),
+    }, {}, 'project: not-moving'],
+    ['a project with three pages of nothing new', {
+      ...NOTHING,
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'c1'),
+      [PROJECT(P1, 'c1')]: projectPage([projectEntry(1)], 'c2'),
+      [PROJECT(P1, 'c2')]: projectPage([projectEntry(1)], 'c3'),
+      [PROJECT(P1, 'c3')]: projectPage([projectEntry(1)], 'c4'),
+    }, {}, 'project: not-moving'],
+    ['the request limit reached in a project', {
+      ...NOTHING,
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'a'),
+      [PROJECT(P1, 'a')]: projectPage([projectEntry(2)], 'b'),
+      [PROJECT(P1, 'b')]: projectPage([projectEntry(3)], null),
+    }, { maxRequests: 5 }, 'request-limit'],
+    ['the request limit reached before the sidebar', NOTHING, { maxRequests: 2 }, 'request-limit'],
+    ['a stop on a project page', { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: json({}, 429) }, {}, 'rate-limited'],
+    ['a stop before the sidebar', { ...NOTHING, [MAIN(0)]: json({}, 401) }, {}, 'signed-out'],
+  ];
+  for (const [what, table, options, reason] of short) {
+    const result = await run(table, options).result;
+    assert.deepEqual({ what, reason: result.reason, projectsWhole: result.projectsWhole }, { what, reason, projectsWhole: false });
+  }
 });
 
 test('the wait is crawl_delay as it reads when the wait starts', async () => {

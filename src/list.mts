@@ -124,6 +124,15 @@ export interface WalkResult {
   // read, counted ('2 items with no id', '3 items with an unreadable
   // update_time'). The lists are named, but no project, chat or title is.
   readonly reason: string;
+  // Whether the walk saw every project chat in the window: the sidebar and
+  // each project it named were read to their end (an empty page, a cursor
+  // that is null, missing or '', or a page with nothing in the window), with
+  // no stop, failure, bad page or cut on any of them. When false, a starred or
+  // archived chat in a project the walk did not finish was taken from the
+  // starred or archived list, so its upload time may not be the one the
+  // spider stored for it, and the pass holds such chats back. Chats a project
+  // lists that could not be read leave it true; the reason counts them.
+  readonly projectsWhole: boolean;
   // The wait a rate-limited or challenged answer asked for, when it named one.
   readonly retryAfterMs?: number;
 }
@@ -291,10 +300,16 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   };
   let noId = 0;
   let noUpdateTime = 0;
+  // The lists that ended short of their end (failed, cut, or a bad page), and
+  // whether the walk got past the last project. Together they give
+  // projectsWhole.
+  const short = new Set<string>();
+  let projectsDone = false;
 
   // A list read only in part: cut at the page limit, or paging that does not
   // move on.
   const cut = (reason: string, what: string) => {
+    short.add(what);
     problem(`${what}: ${reason}`);
     say(`the ${what} list was read only in part (${reason})`);
   };
@@ -366,6 +381,7 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   // A list that could not be read to its end. A failure that stops the walk is
   // handed back to stop it; any other is named and ends that list only.
   const ended = (what: string, page: number, why: Failure): Failure | null => {
+    short.add(what);
     say(`the ${what} list ended at page ${page} (${why.reason})`);
     if (STOPS.has(why.reason)) {
       return why;
@@ -532,13 +548,15 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
         return stopped;
       }
     }
+    projectsDone = true;
     return null;
   }
 
   const stopped = await walk();
   const found = [...items.values()];
+  const projectsWhole = projectsDone && !short.has('sidebar') && !short.has('project');
   if (stopped !== null) {
-    return { items: found, outcome: 'failed', reason: stopped.reason, ...(stopped.retryAfterMs === null ? {} : { retryAfterMs: stopped.retryAfterMs }) };
+    return { items: found, outcome: 'failed', reason: stopped.reason, projectsWhole, ...(stopped.retryAfterMs === null ? {} : { retryAfterMs: stopped.retryAfterMs }) };
   }
   const plural = (count: number) => `${count} ${count === 1 ? 'item' : 'items'}`;
   const reasons = [...problems];
@@ -549,7 +567,7 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
     reasons.push(`${plural(noUpdateTime)} with an unreadable update_time`);
   }
   if (reasons.length === 0) {
-    return { items: found, outcome: 'whole', reason: 'ok' };
+    return { items: found, outcome: 'whole', reason: 'ok', projectsWhole };
   }
-  return { items: found, outcome: 'partial', reason: reasons.join('; ') };
+  return { items: found, outcome: 'partial', reason: reasons.join('; '), projectsWhole };
 }
