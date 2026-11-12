@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { DateString } from '@bric/rex-types/types';
+
 import { type Answer, RequestError } from '../../src/client.mts';
 import { type CrawlWindow, type ListItem, MAX_PAGES, walkLists, uploadTime } from '../../src/list.mts';
 
@@ -265,19 +267,92 @@ test('a chat repeated on a later page of the same list is returned once, as firs
   assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
 });
 
-test('a list item holds the id, the title, the creation time in seconds, the update time and the source, and nothing else', async () => {
+test('a list item holds the id, the title, the creation and update times, and the source, and nothing else', async () => {
   const fake = run({ ...NOTHING, [MAIN(0)]: page([entry(1, T0), { ...entry(2, T0 - 1000), title: null }, { ...entry(3, T0 - 2000), title: 42, create_time: null }]), [MAIN(28)]: empty() });
   const result = await fake.result;
   const [one, two, three] = result.items;
-  assert.deepEqual(Object.keys(one).sort(), ['createSec', 'id', 'source', 'title', 'updated']);
+  assert.deepEqual(Object.keys(one).sort(), ['id', 'source', 'started', 'title', 'updated']);
   assert.equal(one.id, chatId(1));
   assert.equal(one.title, 'SECRET-TITLE-1');
-  assert.equal(one.createSec, (T0 - 60_000) / 1000);
+  assert.equal(one.started?.timestamp(), T0 - 60_000);
   assert.equal(one.updated.timestamp(), T0);
   assert.equal(one.source, 'main');
   assert.equal(two.title, null);
   assert.equal(three.title, null);
-  assert.equal(three.createSec, null);
+  assert.equal(three.started, null);
+});
+
+test('started of a main, archived or starred chat is new DateString(create_time), with the microseconds of its ISO string', async () => {
+  const fake = run({
+    [MAIN(0)]: page([entry(1, T0)]),
+    [MAIN(28)]: empty(),
+    [ARCHIVED(0)]: page([entry(2, T0)]),
+    [ARCHIVED(28)]: empty(),
+    [STARRED(0)]: page([entry(3, T0)]),
+    [STARRED(28)]: empty(),
+    [SIDEBAR]: json({ items: [] }),
+  });
+  const result = await fake.result;
+  assert.deepEqual(result.items.map((item) => item.source), ['main', 'archived', 'starred']);
+  const created = iso(T0 - 60_000, '123');
+  assert.equal(created, '2026-09-08T13:48:43.781123Z');
+  for (const item of result.items) {
+    assert.equal(JSON.stringify(item.started), JSON.stringify(new DateString(created)));
+    assert.equal(JSON.stringify(item.started), '"2026-09-08T13:48:43.781123Z"');
+  }
+});
+
+test('started of a chat only a project lists is the project path value: new DateString(Date.parse(create_time) / 1000)', async () => {
+  // 40 different milliseconds, with microseconds on the ISO strings as the capture saw them.
+  const times = Array.from({ length: 40 }, (_, k) => T0 + k * 7);
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage(times.map((ms, k) => ({ ...projectEntry(k + 1, ms), create_time: iso(ms - 60_000, '987') })), null),
+  });
+  const result = await fake.result;
+  assert.equal(result.items.length, 40);
+  let differs = 0;
+  for (const [k, item] of result.items.entries()) {
+    const created = iso(times[k] - 60_000, '987');
+    const old = new DateString(Date.parse(created) / 1000);
+    assert.equal(item.source, 'project');
+    assert.equal(item.started?.timestamp(), old.timestamp());
+    assert.equal(JSON.stringify(item.started), JSON.stringify(old));
+    if (JSON.stringify(old) !== JSON.stringify(new DateString(created))) differs += 1;
+  }
+  assert.ok(differs > 0, 'no value differed from the main path, so this proved nothing about the project path');
+});
+
+test('a chat whose create_time cannot be read is still listed, with started null, is not counted as unreadable, and its create_time is not logged', async (t) => {
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  // Date.parse reads 'SECRET-TITLE-2' as a date in February 2001, so it is no test of an ISO string.
+  const bad = [undefined, null, '', 'SECRET-TITLE not a date', 'SECRET-TITLE-2', 1788875383.781, '2026-09-08'];
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page(bad.map((create_time, k) => ({ ...entry(k + 1, T0 - k * 1000), create_time }))),
+    [MAIN(28)]: empty(),
+  });
+  const result = await fake.result;
+  assert.deepEqual(ids(result.items), bad.map((_, k) => chatId(k + 1)));
+  assert.deepEqual(result.items.map((item) => item.started), bad.map(() => null));
+  assert.deepEqual(result.items.map((item) => item.updated.timestamp()), bad.map((_, k) => T0 - k * 1000));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
+  // The project path reads create_time with Date.parse, and must not take 'SECRET-TITLE-2' for a date either.
+  const other = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(1), create_time: 'not a date' }, { ...projectEntry(2), create_time: 'SECRET-TITLE-2' }, { ...projectEntry(3), create_time: undefined }], null),
+  });
+  const projectResult = await other.result;
+  assert.deepEqual(projectResult.items.map((item) => item.started), [null, null, null]);
+  assert.equal(projectResult.outcome, 'whole');
+  for (const line of [...printed, ...fake.logs, ...other.logs]) {
+    assert.ok(!line.includes('SECRET'), `"${line}" shows a create_time`);
+  }
 });
 
 test('uploadTime of a main, archived or starred chat is new DateString(update_time), from the ISO string', async () => {
@@ -347,14 +422,48 @@ test('the project path value is what the old code computed: new DateString(Date.
   assert.ok(dropped > 0, 'no value hit the 1 ms drop, so this proved nothing about it');
 });
 
-test('a failed request stops the walk, and the reason names the kind of failure', async () => {
-  const cases: [string, Reply, string][] = [
+// A rate limit, a challenge and a signed-out answer stop the whole walk: the
+// next request would meet the same answer, and the pass has to back off.
+test('a rate-limited, challenged or signed-out answer stops the whole walk as failed, whichever list it comes on', async () => {
+  const stops: [string, Reply, string][] = [
     ['a 401', json({}, 401), 'signed-out'],
-    ['a 403', json({}, 403), 'refused'],
     ['a 429', json({}, 429), 'rate-limited'],
     ['a 503', json({}, 503), 'rate-limited'],
-    ['a 500', json({}, 500), 'server'],
+    ['a Retry-After on a 500', json({}, 500, { 'retry-after': '5' }), 'rate-limited'],
     ['a challenge', { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: '<html>' }, 'challenge'],
+  ];
+  const lists: [string, string, string[]][] = [
+    ['main', MAIN(0), [MAIN(0)]],
+    ['archived', ARCHIVED(0), [MAIN(0), ARCHIVED(0)]],
+    ['starred', STARRED(0), [MAIN(0), ARCHIVED(0), STARRED(0)]],
+    ['the sidebar', SIDEBAR, [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]],
+  ];
+  for (const [what, reply, reason] of stops) {
+    for (const [list, url, expected] of lists) {
+      const fake = run({ ...NOTHING, [url]: reply });
+      const result = await fake.result;
+      assert.deepEqual({ what, list, outcome: result.outcome, reason: result.reason, urls: fake.urls }, { what, list, outcome: 'failed', reason, urls: expected });
+    }
+    // and on a project's page
+    const fake = run({ ...NOTHING, [SIDEBAR]: json(sidebarOf(P1, P2)), [PROJECT(P1, '0')]: reply });
+    const result = await fake.result;
+    assert.deepEqual({ what, outcome: result.outcome, reason: result.reason, last: fake.urls.at(-1) }, { what, outcome: 'failed', reason, last: PROJECT(P1, '0') });
+  }
+});
+
+// Any other failure ends only the list it came on, and the walk is partial.
+test('a refused, server, not-json, timeout, network or bad-page failure ends only that list, and names it', async () => {
+  const lists: [string, string, string[]][] = [
+    ['main', MAIN(0), [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]],
+    ['archived', ARCHIVED(0), [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]],
+    ['starred', STARRED(0), [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]],
+    ['sidebar', SIDEBAR, [MAIN(0), ARCHIVED(0), STARRED(0), SIDEBAR]],
+  ];
+  const failures: [string, Reply, string][] = [
+    ['a 403', json({}, 403), 'refused'],
+    ['a 404', json({}, 404), 'refused'],
+    ['a 500', json({}, 500), 'server'],
+    ['a 502', json({}, 502), 'server'],
     ['an HTML page', { status: 200, headers: {}, text: '<html>' }, 'not-json'],
     ['a timeout', new RequestError('timeout'), 'timeout'],
     ['a network error', new RequestError('network'), 'network'],
@@ -363,15 +472,121 @@ test('a failed request stops the walk, and the reason names the kind of failure'
     ['a body with no items', json({ total: 3 }), 'bad-page'],
     ['a body whose items is not a list', json({ items: 'x' }), 'bad-page'],
   ];
-  for (const [name, reply, reason] of cases) {
-    const fake = run({ [MAIN(0)]: reply });
-    const result = await fake.result;
-    assert.deepEqual({ name, items: result.items, outcome: result.outcome, reason: result.reason }, { name, items: [], outcome: 'failed', reason });
-    assert.deepEqual(fake.urls, [MAIN(0)], `${name}: made another request after the failure`);
+  for (const [what, reply, kind] of failures) {
+    for (const [list, url, expected] of lists) {
+      const fake = run({ ...NOTHING, [url]: reply });
+      const result = await fake.result;
+      assert.deepEqual({ what, list, outcome: result.outcome, reason: result.reason, urls: fake.urls }, { what, list, outcome: 'partial', reason: `${list}: ${kind}`, urls: expected });
+      assert.ok(!('retryAfterMs' in result));
+    }
   }
 });
 
-test('a failure after some chats were read is a partial walk that returns them, and makes no further request', async () => {
+test('a 503 on the archived list stops the walk before starred, and carries the wait', async () => {
+  const fake = run({
+    [MAIN(0)]: page([entry(1)]),
+    [MAIN(28)]: empty(),
+    [ARCHIVED(0)]: json({}, 503, { 'retry-after': '45' }),
+    [STARRED(0)]: page([entry(2)]),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(3)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls, [MAIN(0), MAIN(28), ARCHIVED(0)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { outcome: 'failed', reason: 'rate-limited', retryAfterMs: 45_000 });
+  // What was read before the stop is still in the result; a failed walk is not to be acted on.
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+});
+
+test('a 500 on the archived list still reads starred and the projects, and the walk is partial', async () => {
+  const fake = run({
+    [MAIN(0)]: page([entry(1)]),
+    [MAIN(28)]: empty(),
+    [ARCHIVED(0)]: json({}, 500),
+    [STARRED(0)]: page([entry(2)]),
+    [STARRED(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(3)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls, [MAIN(0), MAIN(28), ARCHIVED(0), STARRED(0), STARRED(28), SIDEBAR, PROJECT(P1, '0')]);
+  assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'archived: server' });
+});
+
+test('a failure on a later page ends that list and keeps the chats of its earlier pages', async () => {
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([entry(1), entry(2)]),
+    [MAIN(28)]: json({}, 500),
+    [ARCHIVED(0)]: page([entry(3)]),
+    [ARCHIVED(28)]: empty(),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls, [MAIN(0), MAIN(28), ARCHIVED(0), ARCHIVED(28), STARRED(0), SIDEBAR]);
+  assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'main: server' });
+});
+
+test('a 403 on one project\'s page still reads the next project', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    [PROJECT(P1, '0')]: json({}, 403),
+    [PROJECT(P2, '0')]: projectPage([projectEntry(2)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P2, '0')]);
+  assert.deepEqual(ids(result.items), [chatId(2)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: refused' });
+});
+
+test('a 403 on a later page of a project keeps its earlier pages and reads the next project', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'a'),
+    [PROJECT(P1, 'a')]: json({}, 403),
+    [PROJECT(P2, '0')]: projectPage([projectEntry(2)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(ids(result.items), [1, 2].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: refused' });
+});
+
+test('two projects that fail the same way are named once, and the reason holds no project id', async () => {
+  const fake = run({ ...NOTHING, [SIDEBAR]: json(sidebarOf(P1, P2)), [PROJECT(P1, '0')]: json({}, 403), [PROJECT(P2, '0')]: json({}, 403) });
+  const result = await fake.result;
+  assert.equal(result.reason, 'project: refused');
+  assert.ok(!result.reason.includes('g-p-'));
+});
+
+test('a sidebar page that fails after the first still has its projects read', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json({ ...sidebarOf(P1), cursor: 'S2' }),
+    [SIDEBAR_AT('S2')]: json({}, 500),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(3), [SIDEBAR, SIDEBAR_AT('S2'), PROJECT(P1, '0')]);
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'sidebar: server' });
+});
+
+test('a walk in which every list fails is partial with no chats, and names each list', async () => {
+  const fake = run({ [MAIN(0)]: json({}, 500), [ARCHIVED(0)]: json({}, 500), [STARRED(0)]: json({}, 500), [SIDEBAR]: json({}, 500) });
+  const result = await fake.result;
+  assert.deepEqual({ items: result.items, outcome: result.outcome, reason: result.reason }, { items: [], outcome: 'partial', reason: 'main: server; archived: server; starred: server; sidebar: server' });
+});
+
+test('a failure that stops the walk beats the lists that failed before it', async () => {
+  const fake = run({ ...NOTHING, [MAIN(0)]: json({}, 500), [ARCHIVED(0)]: json({}, 429) });
+  const result = await fake.result;
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'rate-limited' });
+});
+
+test('a stop after some chats were read is a failed walk that still holds them, and makes no further request', async () => {
   const fake = run({
     [MAIN(0)]: page([entry(1), entry(2)]),
     [MAIN(28)]: { status: 429, headers: { 'retry-after': '90' }, text: '{}' },
@@ -379,7 +594,7 @@ test('a failure after some chats were read is a partial walk that returns them, 
   const result = await fake.result;
   assert.deepEqual(fake.urls, [MAIN(0), MAIN(28)]);
   assert.deepEqual(ids(result.items), [chatId(1), chatId(2)]);
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { outcome: 'partial', reason: 'rate-limited', retryAfterMs: 90_000 });
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { outcome: 'failed', reason: 'rate-limited', retryAfterMs: 90_000 });
 });
 
 test('a rate limit on a project list stops the walk there, keeps what the earlier lists gave and carries the wait', async () => {
@@ -393,7 +608,7 @@ test('a rate limit on a project list stops the walk there, keeps what the earlie
   });
   const result = await fake.result;
   assert.ok(!fake.urls.includes(PROJECT(P2, '0')));
-  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { ids: [chatId(1)], outcome: 'partial', reason: 'rate-limited', retryAfterMs: 30_000 });
+  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { ids: [chatId(1)], outcome: 'failed', reason: 'rate-limited', retryAfterMs: 30_000 });
 });
 
 test('a failure with nothing returned is failed, and a retry wait is left out when the answer named none', async () => {
@@ -404,31 +619,79 @@ test('a failure with nothing returned is failed, and a retry wait is left out wh
   assert.ok(!('retryAfterMs' in result));
 });
 
-test('a chat with no usable id or update time is skipped, and the walk is partial', async () => {
+test('a chat whose update_time cannot be read is skipped and counted, and the reason carries the count', async (t) => {
+  // rex-types logs a date it cannot parse; keep that out of the test output.
+  t.mock.method(console, 'log', () => {});
   const fake = run({
     ...NOTHING,
     [MAIN(0)]: page([
       entry(1),
-      { ...entry(2), id: undefined },
-      { ...entry(3), id: '' },
-      { ...entry(4), id: 7 },
-      { ...entry(5), update_time: undefined },
-      { ...entry(6), update_time: 'SECRET-TITLE not a date' },
-      { ...entry(7), update_time: 1788875383.781 },
-      null,
-      'SECRET-TITLE',
+      { ...entry(2), update_time: undefined },
+      { ...entry(3), update_time: 'SECRET-TITLE not a date' },
+      { ...entry(4), update_time: 1788875383.781 },
+      { ...entry(5), update_time: '2026-09-08' },
     ]),
     [MAIN(28)]: empty(),
   });
   const result = await fake.result;
   assert.deepEqual(ids(result.items), [chatId(1)]);
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'unreadable-item' });
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '4 items with an unreadable update_time' });
 });
 
-test('a walk whose every chat is unreadable is failed, not an empty account', async () => {
+test('one unreadable update_time is counted as one item, and the count adds up over lists and pages', async () => {
+  const one = run({ ...NOTHING, [MAIN(0)]: page([entry(1), { ...entry(2), update_time: 'x' }]), [MAIN(28)]: empty() });
+  assert.equal((await one.result).reason, '1 item with an unreadable update_time');
+  const many = run({
+    ...NOTHING,
+    [MAIN(0)]: page([entry(1), { ...entry(2), update_time: 'x' }]),
+    [MAIN(28)]: page([entry(3), { ...entry(4), update_time: 'x' }]),
+    [MAIN(56)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(5), update_time: 'x' }], null),
+  });
+  const result = await many.result;
+  assert.deepEqual(ids(result.items), [chatId(1), chatId(3)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '3 items with an unreadable update_time' });
+});
+
+test('a chat with no id is counted too, and the count comes with the lists that failed', async () => {
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([entry(1), { ...entry(2), id: undefined }, { ...entry(3), id: '' }, { ...entry(4), id: 7 }, null, 'SECRET-TITLE', { ...entry(5), update_time: 'x' }]),
+    [MAIN(28)]: empty(),
+    [ARCHIVED(0)]: json({}, 500),
+  });
+  const result = await fake.result;
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'archived: server; 5 items with no id; 1 item with an unreadable update_time' });
+});
+
+test('the reason of a walk with unreadable chats holds no title, and neither does what it logs', async (t) => {
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([entry(1), { ...entry(2), update_time: 'SECRET-TITLE-2' }, { ...entry(3), update_time: null }]),
+    [MAIN(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(4), update_time: 'SECRET-SNIPPET-4' }], null),
+  });
+  const result = await fake.result;
+  assert.equal(result.reason, '3 items with an unreadable update_time');
+  assert.ok(fake.logs.length > 0, 'nothing was logged, so this proved nothing');
+  for (const line of [result.reason, ...fake.logs, ...printed]) {
+    for (const secret of ['SECRET-TITLE', 'SECRET-SNIPPET', 'SECRET-EMAIL', 'SECRET-NAME']) {
+      assert.ok(!line.includes(secret), `"${line}" shows ${secret}`);
+    }
+  }
+});
+
+test('a walk whose every chat is unreadable is partial with no chats, which the reason says', async () => {
   const fake = run({ ...NOTHING, [MAIN(0)]: page([{ ...entry(1), update_time: undefined }]), [MAIN(28)]: empty() });
   const result = await fake.result;
-  assert.deepEqual({ items: result.items, outcome: result.outcome, reason: result.reason }, { items: [], outcome: 'failed', reason: 'unreadable-item' });
+  assert.deepEqual({ items: result.items, outcome: result.outcome, reason: result.reason }, { items: [], outcome: 'partial', reason: '1 item with an unreadable update_time' });
 });
 
 test('an unreadable chat on the first page does not end the list, and a bad project entry is skipped too', async () => {
@@ -450,7 +713,7 @@ test('a list that keeps giving full pages is cut at the page limit, and the walk
   const result = await fake.result;
   assert.deepEqual(fake.urls, [MAIN(0), MAIN(28), MAIN(56), ARCHIVED(0), STARRED(0), SIDEBAR]);
   assert.equal(result.items.length, 6);
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'page-limit' });
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'main: page-limit' });
 });
 
 test('the default page limit is 1000', () => {
@@ -462,7 +725,7 @@ test('a list whose pages bring nothing new three times in a row is cut: its pagi
   const fake = run({ ...NOTHING, [MAIN(0)]: same, [MAIN(28)]: same, [MAIN(56)]: same, [MAIN(84)]: same, [MAIN(112)]: same });
   const result = await fake.result;
   assert.deepEqual(fake.urls.slice(0, 5), [MAIN(0), MAIN(28), MAIN(56), MAIN(84), ARCHIVED(0)]);
-  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason }, { ids: [chatId(1), chatId(2)], outcome: 'partial', reason: 'not-moving' });
+  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason }, { ids: [chatId(1), chatId(2)], outcome: 'partial', reason: 'main: not-moving' });
 });
 
 test('one page that repeats chats is ordinary: chats move up between two calls', async () => {
@@ -489,15 +752,14 @@ test('a project cursor that comes back again cuts that project, and the next pro
   const result = await fake.result;
   assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P1, 'a'), PROJECT(P2, '0')]);
   assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'not-moving' });
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: not-moving' });
 });
 
 test('a sidebar cursor that comes back again ends the sidebar', async () => {
   const fake = run({ ...NOTHING, [SIDEBAR]: json({ ...sidebarOf(), cursor: 'S' }), [SIDEBAR_AT('S')]: json({ ...sidebarOf(), cursor: 'S' }) });
   const result = await fake.result;
   assert.deepEqual(fake.urls.slice(3), [SIDEBAR, SIDEBAR_AT('S')]);
-  // Nothing was returned from a walk that was cut, so it is not an empty account.
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'failed', reason: 'not-moving' });
+  assert.deepEqual({ items: result.items, outcome: result.outcome, reason: result.reason }, { items: [], outcome: 'partial', reason: 'sidebar: not-moving' });
 });
 
 test('the whole walk is bounded by a request limit, whichever lists the requests go to', async () => {
@@ -632,7 +894,7 @@ test('the default log writes to the console, with the module prefix and the same
   }
 });
 
-test('when two lists are cut, the reason is the first one', async () => {
+test('two lists that are cut are both named, in the order they were cut', async () => {
   const fresh = (offset: number) => page([entry(offset + 1, T0 - offset)]);
   const same = page([entry(900)]);
   const fake = run({
@@ -643,18 +905,17 @@ test('when two lists are cut, the reason is the first one', async () => {
     [ARCHIVED(0)]: same, [ARCHIVED(28)]: same, [ARCHIVED(56)]: same, [ARCHIVED(84)]: same,
   }, { maxPages: 4 });
   const result = await fake.result;
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'page-limit' });
-  assert.ok(fake.logs.some((line) => line.includes('not-moving')), 'the second cut was not logged');
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'main: page-limit; archived: not-moving' });
 });
 
-test('a failure after an unreadable chat names the failure, not the chat', async () => {
+test('a stop after an unreadable chat names the stop, not the chat', async () => {
   const fake = run({
     ...NOTHING,
     [MAIN(0)]: page([entry(1), { ...entry(2), update_time: undefined }]),
     [MAIN(28)]: json({}, 429, { 'retry-after': '10' }),
   });
   const result = await fake.result;
-  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { ids: [chatId(1)], outcome: 'partial', reason: 'rate-limited', retryAfterMs: 10_000 });
+  assert.deepEqual({ ids: ids(result.items), outcome: result.outcome, reason: result.reason, retryAfterMs: result.retryAfterMs }, { ids: [chatId(1)], outcome: 'failed', reason: 'rate-limited', retryAfterMs: 10_000 });
 });
 
 test('a date with no time of day is unreadable: Date.parse reads it, an ISO instant is not one', async (t) => {
@@ -663,7 +924,7 @@ test('a date with no time of day is unreadable: Date.parse reads it, an ISO inst
   const fake = run({ ...NOTHING, [MAIN(0)]: page([{ ...entry(1), update_time: '2026-09-08' }, entry(2)]), [MAIN(28)]: empty() });
   const result = await fake.result;
   assert.deepEqual(ids(result.items), [chatId(2)]);
-  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'unreadable-item' });
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '1 item with an unreadable update_time' });
 });
 
 test('a walk with a log that throws still ends in a result', async () => {
@@ -672,5 +933,6 @@ test('a walk with a log that throws still ends in a result', async () => {
       throw new Error('log sink is gone');
     },
   });
-  assert.equal((await fake).outcome, 'failed');
+  const result = await fake;
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '3 items with no id' });
 });

@@ -35,11 +35,15 @@ export interface ListItem {
   readonly id: string;
   // The list's title as sent. Hashed before anything leaves the spider.
   readonly title: string | null;
-  // The list's create_time, in epoch seconds with millisecond precision
-  // (Date.parse(create_time) / 1000), null when absent or unreadable.
-  readonly createSec: number | null;
-  // The list's update_time, read from its ISO string with its microseconds.
-  // uploadTime is what the upload key uses.
+  // The list's create_time as the spider has always read it on each path: a
+  // main, archived or starred chat's is new DateString(create_time), from the
+  // ISO string with its microseconds; a project chat's is
+  // new DateString(Date.parse(create_time) / 1000), which has milliseconds
+  // only and rounding noise below them. Null when create_time is absent or
+  // unreadable; the chat is still listed.
+  readonly started: DateString | null;
+  // The list's update_time, read from its ISO string with its microseconds on
+  // every source. uploadTime is what the upload key uses.
   readonly updated: DateString;
   // The first list the chat was seen on: main, archived, starred, project.
   readonly source: Source;
@@ -71,16 +75,22 @@ export interface WalkResult {
   // Each chat in the crawl window once, main list first, then archived, then
   // starred, then the projects, each list newest first.
   readonly items: ListItem[];
-  // whole: every list was read to its end. partial: something went wrong, and
-  // there are chats. failed: something went wrong and there are none, which is
-  // not an empty account.
+  // whole: every list was read to its end and every chat was readable.
+  // failed: an answer that was rate-limited, challenged or signed-out stopped
+  // the walk, since the next request would meet the same answer. items holds
+  // what was read before it, and is not to be acted on. partial: anything else
+  // went wrong and the walk went on; items may be empty, which is then not an
+  // empty account.
   readonly outcome: WalkOutcome;
-  // 'ok' for a whole walk. Otherwise the first thing that went wrong, and a
-  // failure that stopped the walk beats a list that was only cut: the
-  // classification of the answer that stopped it (signed-out, refused,
-  // rate-limited, challenge, server, not-json), timeout, network, bad-page,
-  // request-limit; or, for a walk that went on, unreadable-item, page-limit,
-  // not-moving.
+  // 'ok' for a whole walk. For failed, the bare classification of the answer
+  // that stopped it: rate-limited, challenge or signed-out. For partial, what
+  // went wrong, each thing once, joined by '; ': a list that ended on a
+  // failure or was cut ('archived: server', 'main: page-limit', 'project:
+  // refused', 'sidebar: not-moving'; the failure is one of refused, server,
+  // not-json, timeout, network, bad-page) or 'request-limit' if the walk hit
+  // its limit, in the order they happened, then the chats that could not be
+  // read, counted ('2 items with no id', '3 items with an unreadable
+  // update_time'). The lists are named, but no project, chat or title is.
   readonly reason: string;
   // The wait a rate-limited or challenged answer asked for, when it named one.
   readonly retryAfterMs?: number;
@@ -109,24 +119,46 @@ function cursorUrl(base: string, cursor: string): string {
 const sidebarUrl = (cursor: string | null) => (cursor === null ? SIDEBAR : cursorUrl(SIDEBAR, cursor));
 const projectUrl = (projectId: string, cursor: string) => cursorUrl(`${API}/gizmos/${encodeURIComponent(projectId)}/conversations`, cursor);
 
-// A chat is read only with an id and an update_time Date.parse and the
-// instant parser both read; anything else is skipped and counted, so the walk
-// says it was partial, and not guessed at. The date is checked before
-// DateString sees it because DateString logs what it cannot read.
-function readItem(raw: unknown, source: Source): ListItem | null {
+// An ISO 8601 instant: a date, a time, and Z or an offset. The capture's are
+// like "2026-09-08T13:48:43.781123Z". It is checked by shape, and not by
+// Date.parse, which reads almost any string with a number in it ("TITLE-2" is
+// February 2001), because DateString logs the value it cannot read and these
+// fields are not ours to log.
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)$/;
+
+// A string read as an instant, or null.
+function instant(value: unknown): DateString | null {
+  if (typeof value !== 'string' || !ISO_INSTANT.test(value)) {
+    return null;
+  }
+  const read = new DateString(value);
+  return read.value === null ? null : read;
+}
+
+// A chat is read only with an id and an update_time; one without is skipped
+// and counted (the answer says which), so the walk says it was partial and the
+// chat is not guessed at. A create_time that cannot be read only gives a null
+// started.
+function readItem(raw: unknown, source: Source): ListItem | 'no-id' | 'no-update-time' {
   if (typeof raw !== 'object' || raw === null) {
-    return null;
+    return 'no-id';
   }
-  const { id, title, create_time: created, update_time: updatedAt } = raw as Record<string, unknown>;
-  if (typeof id !== 'string' || id === '' || typeof updatedAt !== 'string' || Number.isNaN(Date.parse(updatedAt))) {
-    return null;
+  const { id, title, create_time: createdAt, update_time: updatedAt } = raw as Record<string, unknown>;
+  if (typeof id !== 'string' || id === '') {
+    return 'no-id';
   }
-  const updated = new DateString(updatedAt);
-  if (updated.value === null) {
-    return null;
+  const updated = instant(updatedAt);
+  if (updated === null) {
+    return 'no-update-time';
   }
-  const createdMs = typeof created === 'string' ? Date.parse(created) : Number.NaN;
-  return { id, title: typeof title === 'string' ? title : null, createSec: Number.isNaN(createdMs) ? null : createdMs / 1000, updated, source };
+  let started: DateString | null;
+  if (source === 'project') {
+    const createdMs = typeof createdAt === 'string' && ISO_INSTANT.test(createdAt) ? Date.parse(createdAt) : Number.NaN;
+    started = Number.isNaN(createdMs) ? null : new DateString(createdMs / 1000);
+  } else {
+    started = instant(createdAt);
+  }
+  return { id, title: typeof title === 'string' ? title : null, started, updated, source };
 }
 
 // The time the upload key is built from, as the spider has always built it on
@@ -164,6 +196,10 @@ type Read = { readonly body: Record<string, unknown> } | { readonly failure: Fai
 
 const failure = (reason: string, retryAfter: number | null = null): { failure: Failure } => ({ failure: { reason, retryAfterMs: retryAfter } });
 
+// These stop the whole walk: the next request would meet the same answer, and
+// the pass has to back off or sign in. Any other failure ends only its list.
+const STOPS: ReadonlySet<string> = new Set(['rate-limited', 'challenge', 'signed-out']);
+
 export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow, pace: Pace, { log = defaultLog, maxPages = MAX_PAGES, maxRequests = MAX_REQUESTS }: WalkOptions = {}): Promise<WalkResult> {
   const sleep = pace.sleep ?? timer;
   // A log that throws has nowhere left to report to.
@@ -176,17 +212,57 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   };
   const items = new Map<string, ListItem>();
   let requests = 0;
-  // The first reason a list was read only in part, when the walk went on.
-  let cutReason: string | null = null;
+  // What went wrong on a walk that went on, each once, in the order it
+  // happened, and the chats that could not be read.
+  const problems: string[] = [];
+  const problem = (text: string) => {
+    if (!problems.includes(text)) {
+      problems.push(text);
+    }
+  };
+  let noId = 0;
+  let noUpdateTime = 0;
+
+  // A list read only in part: cut at the page limit, or paging that does not
+  // move on.
   const cut = (reason: string, what: string) => {
-    cutReason ??= reason;
+    problem(`${what}: ${reason}`);
     say(`the ${what} list was read only in part (${reason})`);
   };
-  const skipped = (count: number, what: string) => {
-    if (count > 0) {
-      cutReason ??= 'unreadable-item';
-      say(`skipped ${count} entries of the ${what} list with no usable id or update_time`);
+
+  // Reads a page's chats into the items, counting what it cannot read. Returns
+  // how many were new to the list (when `seen` tracks it) and how many were in
+  // the window.
+  const take = (list: unknown[], source: Source, seen: Set<string> | null) => {
+    let fresh = 0;
+    let inside = 0;
+    let unreadable = 0;
+    for (const raw of list) {
+      const item = readItem(raw, source);
+      if (typeof item === 'string') {
+        unreadable += 1;
+        if (item === 'no-id') {
+          noId += 1;
+        } else {
+          noUpdateTime += 1;
+        }
+        continue;
+      }
+      if (seen !== null && !seen.has(item.id)) {
+        seen.add(item.id);
+        fresh += 1;
+      }
+      if (inWindow(window, item.updated.timestamp())) {
+        inside += 1;
+        if (!items.has(item.id)) {
+          items.set(item.id, item);
+        }
+      }
     }
+    if (unreadable > 0) {
+      say(`skipped ${unreadable} entries of the ${source} list with no usable id or update_time`);
+    }
+    return { fresh, inside };
   };
 
   // One paced request, answered as a JSON object or as why it was not.
@@ -217,17 +293,18 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
     return typeof body === 'object' && body !== null && !Array.isArray(body) ? { body: body as Record<string, unknown> } : failure('bad-page');
   }
 
-  // Keeps a chat that is in the window, the first time it is seen, and says
-  // whether it was in the window.
-  const keep = (item: ListItem): boolean => {
-    if (!inWindow(window, item.updated.timestamp())) {
-      return false;
+  // A list that could not be read to its end. A failure that stops the walk is
+  // handed back to stop it; any other is named and ends that list only.
+  const ended = (what: string, page: number, why: Failure): Failure | null => {
+    say(`the ${what} list ended at page ${page} (${why.reason})`);
+    if (STOPS.has(why.reason)) {
+      return why;
     }
-    if (!items.has(item.id)) {
-      items.set(item.id, item);
-    }
-    return true;
+    // The limit is the walk's, not a list's: every list after this one meets it.
+    problem(why.reason === 'request-limit' ? 'request-limit' : `${what}: ${why.reason}`);
+    return null;
   };
+  const badPage: Failure = { reason: 'bad-page', retryAfterMs: null };
 
   // The main, archived and starred lists, by offset. Each stops as the
   // spider's main walk always has: on an empty page, or a page with nothing in
@@ -242,35 +319,16 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
       }
       const got = await read(conversationsUrl(source, pages * PAGE_SIZE));
       if ('failure' in got) {
-        say(`the ${source} list stopped at page ${pages + 1} (${got.failure.reason})`);
-        return got.failure;
+        return ended(source, pages + 1, got.failure);
       }
       const list = got.body.items;
       if (!Array.isArray(list)) {
-        say(`the ${source} list answered a page with no list of chats`);
-        return { reason: 'bad-page', retryAfterMs: null };
+        return ended(source, pages + 1, badPage);
       }
       if (list.length === 0) {
         return null;
       }
-      let inside = 0;
-      let fresh = 0;
-      let unreadable = 0;
-      for (const raw of list) {
-        const item = readItem(raw, source);
-        if (item === null) {
-          unreadable += 1;
-          continue;
-        }
-        if (!seen.has(item.id)) {
-          seen.add(item.id);
-          fresh += 1;
-        }
-        if (keep(item)) {
-          inside += 1;
-        }
-      }
-      skipped(unreadable, source);
+      const { fresh, inside } = take(list, source, seen);
       if (inside === 0) {
         return null;
       }
@@ -283,6 +341,7 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   }
 
   // A cursor is a string or a number; null, undefined and '' end the list.
+  // Undefined is returned for any other value.
   const nextCursor = (value: unknown): string | null | undefined => {
     if (value === undefined || value === null || value === '') {
       return null;
@@ -294,25 +353,24 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
   };
 
   // The sidebar's pages, giving the ids of the projects, g-p- gizmos. Other
-  // gizmos are the account's own GPTs and are no project.
-  async function walkSidebar(): Promise<Failure | string[]> {
+  // gizmos are the account's own GPTs and are no project. A page that fails
+  // ends the sidebar, and the projects of the pages before it are still read.
+  async function walkSidebar(): Promise<{ projects: string[]; stop: Failure | null }> {
     const projects: string[] = [];
     const cursors = new Set<string>();
     let cursor: string | null = null;
     for (let pages = 0; ; pages += 1) {
       if (pages >= maxPages) {
         cut('page-limit', 'sidebar');
-        return projects;
+        return { projects, stop: null };
       }
       const got = await read(sidebarUrl(cursor));
       if ('failure' in got) {
-        say(`the sidebar stopped at page ${pages + 1} (${got.failure.reason})`);
-        return got.failure;
+        return { projects, stop: ended('sidebar', pages + 1, got.failure) };
       }
       const list = got.body.items;
       if (!Array.isArray(list)) {
-        say('the sidebar answered a page with no list of gizmos');
-        return { reason: 'bad-page', retryAfterMs: null };
+        return { projects, stop: ended('sidebar', pages + 1, badPage) };
       }
       for (const entry of list) {
         const id = field(field(field(entry, 'gizmo'), 'gizmo'), 'id');
@@ -322,14 +380,14 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
       }
       const next = nextCursor(got.body.cursor);
       if (next === undefined) {
-        return { reason: 'bad-page', retryAfterMs: null };
+        return { projects, stop: ended('sidebar', pages + 1, badPage) };
       }
       if (next === null) {
-        return projects;
+        return { projects, stop: null };
       }
       if (cursors.has(next)) {
         cut('not-moving', 'sidebar');
-        return projects;
+        return { projects, stop: null };
       }
       cursors.add(next);
       cursor = next;
@@ -350,30 +408,19 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
       cursors.add(cursor);
       const got = await read(projectUrl(projectId, cursor));
       if ('failure' in got) {
-        say(`a project list stopped at page ${pages + 1} (${got.failure.reason})`);
-        return got.failure;
+        return ended('project', pages + 1, got.failure);
       }
       const list = got.body.items;
       if (!Array.isArray(list)) {
-        say('a project list answered a page with no list of chats');
-        return { reason: 'bad-page', retryAfterMs: null };
+        return ended('project', pages + 1, badPage);
       }
       if (list.length === 0) {
         return null;
       }
-      let unreadable = 0;
-      for (const raw of list) {
-        const item = readItem(raw, 'project');
-        if (item === null) {
-          unreadable += 1;
-        } else {
-          keep(item);
-        }
-      }
-      skipped(unreadable, 'project');
+      take(list, 'project', null);
       const next = nextCursor(got.body.cursor);
       if (next === undefined) {
-        return { reason: 'bad-page', retryAfterMs: null };
+        return ended('project', pages + 1, badPage);
       }
       if (next === null) {
         return null;
@@ -393,11 +440,11 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
         return stopped;
       }
     }
-    const projects = await walkSidebar();
-    if (!Array.isArray(projects)) {
-      return projects;
+    const sidebar = await walkSidebar();
+    if (sidebar.stop !== null) {
+      return sidebar.stop;
     }
-    for (const projectId of projects) {
+    for (const projectId of sidebar.projects) {
       const stopped = await walkProject(projectId);
       if (stopped !== null) {
         return stopped;
@@ -408,10 +455,19 @@ export async function walkLists(client: Pick<Client, 'get'>, window: CrawlWindow
 
   const stopped = await walk();
   const found = [...items.values()];
-  const reason = stopped?.reason ?? cutReason;
-  if (reason === null) {
+  if (stopped !== null) {
+    return { items: found, outcome: 'failed', reason: stopped.reason, ...(stopped.retryAfterMs === null ? {} : { retryAfterMs: stopped.retryAfterMs }) };
+  }
+  const plural = (count: number) => `${count} ${count === 1 ? 'item' : 'items'}`;
+  const reasons = [...problems];
+  if (noId > 0) {
+    reasons.push(`${plural(noId)} with no id`);
+  }
+  if (noUpdateTime > 0) {
+    reasons.push(`${plural(noUpdateTime)} with an unreadable update_time`);
+  }
+  if (reasons.length === 0) {
     return { items: found, outcome: 'whole', reason: 'ok' };
   }
-  const wait = stopped?.retryAfterMs ?? null;
-  return { items: found, outcome: found.length > 0 ? 'partial' : 'failed', reason, ...(wait === null ? {} : { retryAfterMs: wait }) };
+  return { items: found, outcome: 'partial', reason: reasons.join('; ') };
 }
