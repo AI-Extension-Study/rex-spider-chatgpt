@@ -42,7 +42,8 @@ const RANK: Readonly<Record<Source, number>> = { main: 0, project: 1, archived: 
 // kept from a list item (the design's allow-list). Each is in its form or
 // null: the times as ISO instants as the list sent them, is_starred true or
 // null (a list sends null, never false, for a chat that is not starred), the
-// flags as booleans, and memory_scope and async_status as type names.
+// flags as booleans, and memory_scope and async_status as type names, or
+// 'unrecognised' for a string of another form.
 export interface ListMeta {
   readonly create_time: string | null;
   // Always set on a listed chat, which needs a readable update_time.
@@ -179,10 +180,11 @@ function instant(value: unknown): DateString | null {
 // The forms of ListMeta. A time is kept as the list sent it when the walk can
 // read it as an instant, by the reader updated and started use (the shape
 // alone lets a 13th month through, and Date.parse takes 30 February). A type
-// name is lowercase letters, digits, _, . and -, at most 64 characters.
+// name is lowercase letters, digits, _, . and -, at most 64 characters; any
+// other string reads 'unrecognised', which carries nothing of it.
 const TYPE_NAME = /^[a-z0-9_.-]{1,64}$/;
 const isoTime = (value: unknown): string | null => (typeof value === 'string' && instant(value) !== null ? value : null);
-const typeName = (value: unknown): string | null => (typeof value === 'string' && TYPE_NAME.test(value) ? value : null);
+const typeName = (value: unknown): string | null => (typeof value !== 'string' ? null : TYPE_NAME.test(value) ? value : 'unrecognised');
 const flag = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
 const idText = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null);
 

@@ -418,7 +418,7 @@ test('meta holds the nine allow-listed list keys, each as the list sent it when 
   });
 });
 
-test('a meta value not in its form is null: booleans, is_starred true only, times by the ISO shape, type names by their pattern', async (t) => {
+test('a meta value not in its form is null: booleans, is_starred true only, times by the ISO shape', async (t) => {
   // DateString prints a time of the right shape that it cannot read, which is
   // digits and punctuation only; keep it out of the test output, and check it.
   const printed: string[] = [];
@@ -433,8 +433,6 @@ test('a meta value not in its form is null: booleans, is_starred true only, time
     // Date.parse reads these two, but the instant reader the walk uses for started and updated does not.
     ['create_time', '2026-02-30T13:48:43Z'], ['pinned_time', '2026-09-08T24:00:00Z'],
     ['pinned_time', 1788875323.781], ['pinned_time', '2026-09-08T13:48:43Z SECRET-TITLE'], ['pinned_time', ''], ['pinned_time', '2026-09-08 13:48:43'],
-    ['memory_scope', 'Global'], ['memory_scope', 'SECRET-TITLE'], ['memory_scope', 'two words'], ['memory_scope', 'x'.repeat(65)], ['memory_scope', ''], ['memory_scope', 5],
-    ['async_status', 'SECRET-TITLE'], ['async_status', 'done!'], ['async_status', ['done']],
   ];
   const fake = run({
     ...NOTHING,
@@ -449,16 +447,38 @@ test('a meta value not in its form is null: booleans, is_starred true only, time
     // meta keeps a create_time exactly when started can read it.
     assert.equal(meta.create_time === null, result.items[k].started === null, `create_time and started disagree on ${key} ${JSON.stringify(value)}`);
   }
-  // and the edges that are in form
-  const edge = run({
-    ...NOTHING,
-    [MAIN(0)]: page([{ ...entry(1), memory_scope: 'x'.repeat(64), async_status: 'a', pinned_time: '2026-09-08T13:48:43+05:30' }]),
-    [MAIN(28)]: empty(),
-  });
+  // and an offset, which is in form
+  const edge = run({ ...NOTHING, [MAIN(0)]: page([{ ...entry(1), pinned_time: '2026-09-08T13:48:43+05:30' }]), [MAIN(28)]: empty() });
   const [item] = (await edge.result).items;
-  assert.deepEqual([item.meta.memory_scope, item.meta.async_status, item.meta.pinned_time], ['x'.repeat(64), 'a', '2026-09-08T13:48:43+05:30']);
+  assert.equal(item.meta.pinned_time, '2026-09-08T13:48:43+05:30');
   for (const line of [...printed, ...fake.logs, ...edge.logs]) {
     assert.ok(!line.includes('SECRET'), `"${line}" shows a marker`);
+  }
+});
+
+// The design's form for these two (design.md, the records table): a type name
+// is kept, any other string becomes 'unrecognised', and anything that is not a
+// string is null. 'unrecognised' carries nothing of the value.
+test('memory_scope and async_status read a type name as it is, another string as unrecognised, and no string as null', async () => {
+  const cases: [unknown, string | null][] = [
+    // type names: lowercase letters, digits, _, . and -, 1 to 64 of them
+    ['global_enabled', 'global_enabled'], ['v2.done-1', 'v2.done-1'], ['a', 'a'], ['x'.repeat(64), 'x'.repeat(64)],
+    // other strings
+    ['Global', 'unrecognised'], ['SECRET-TITLE', 'unrecognised'], ['two words', 'unrecognised'], ['done!', 'unrecognised'], ['x'.repeat(65), 'unrecognised'], ['', 'unrecognised'],
+    // absent, or not a string
+    [undefined, null], [null, null], [5, null], [true, null], [['done'], null], [{ value: 'done' }, null],
+  ];
+  for (const key of ['memory_scope', 'async_status'] as const) {
+    const other = key === 'memory_scope' ? 'async_status' : 'memory_scope';
+    const fake = run({
+      ...NOTHING,
+      // undefined stands for a key the item does not have at all
+      [MAIN(0)]: page(cases.map(([value], k) => (value === undefined ? entry(k + 1) : { ...entry(k + 1), [key]: value }))),
+      [MAIN(28)]: empty(),
+    });
+    const result = await fake.result;
+    assert.deepEqual(result.items.map((item) => item.meta[key]), cases.map(([, expected]) => expected), key);
+    assert.deepEqual(result.items.map((item) => item.meta[other]), cases.map(() => null), `${other} is absent on every item`);
   }
 });
 
