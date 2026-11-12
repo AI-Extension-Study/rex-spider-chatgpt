@@ -88,6 +88,14 @@ test('get sends the token as a bearer header, and nothing else in the headers', 
   assert.deepEqual(calls[0].init.headers, { Authorization: 'Bearer TOKEN-VALUE' });
 });
 
+test('get hands fetch only the method, the headers and the abort signal, as the list calls always have: no credentials or other option', async () => {
+  const calls: Call[] = [];
+  const client = createClient({ token: 'T', fetch: respond(() => new Response('{}'), calls) });
+  await client.get('https://chatgpt.com/backend-api/conversations?offset=0');
+  assert.deepEqual(Object.keys(calls[0].init).sort(), ['headers', 'method', 'signal']);
+  assert.ok(calls[0].init.signal instanceof AbortSignal);
+});
+
 test('get answers any status with its headers (lower-cased) and its body, and does not throw on 429', async () => {
   const client = createClient({
     token: 'T',

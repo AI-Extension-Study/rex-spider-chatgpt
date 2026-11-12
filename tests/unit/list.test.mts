@@ -19,6 +19,7 @@ const PROJECT = (id: string, cursor: string) => `${API}/gizmos/${id}/conversatio
 
 const P1 = 'g-p-0000000000000000000000000000aaaa';
 const P2 = 'g-p-0000000000000000000000000000bbbb';
+const P3 = 'g-p-0000000000000000000000000000cccc';
 
 // The example of the map of 2026-11-12: on the project path, 1788875383781 ms
 // comes out of new DateString(Date.parse(t) / 1000) as 1788875383780.
@@ -50,7 +51,7 @@ const projectEntry = (n: number, ms = T0 - n * 1000) => ({
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Answer => ({ status, headers, text: JSON.stringify(body) });
 const page = (items: unknown[], extra: Record<string, unknown> = {}) => json({ items, total: 99, limit: 28, offset: 0, ...extra });
 const empty = () => page([]);
-const projectPage = (items: unknown[], cursor: string | null | undefined) => json(cursor === undefined ? { items } : { items, cursor });
+const projectPage = (items: unknown[], cursor: unknown) => json(cursor === undefined ? { items } : { items, cursor });
 const sidebarOf = (...ids: unknown[]) => ({ items: ids.map((id) => ({ gizmo: { gizmo: { id }, flair: null }, files: [] })) });
 
 type Reply = Answer | Error;
@@ -152,7 +153,7 @@ test('a later page of the sidebar sets cursor on the same URL, and a project wal
   assert.equal(result.outcome, 'whole');
 });
 
-test('a project walk follows body.cursor until it is null, undefined or empty, or a page has no items', async () => {
+test('a project walk follows body.cursor until it is null or undefined, or a page has no items', async () => {
   const fake = run({
     ...NOTHING,
     [SIDEBAR]: json(sidebarOf(P1, P2)),
@@ -167,6 +168,65 @@ test('a project walk follows body.cursor until it is null, undefined or empty, o
   assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P1, 'a'), PROJECT(P2, '0'), PROJECT(P2, 'b')]);
   assert.deepEqual(ids(result.items), [1, 2, 3].map(chatId));
   assert.equal(result.outcome, 'whole');
+});
+
+test('a project page whose cursor is the empty string ends that project: no ?cursor= request, and the walk is whole', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], ''),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0')]);
+  assert.ok(!fake.urls.some((url) => url.endsWith('?cursor=')), 'asked for a page with an empty cursor');
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
+});
+
+test('a project cursor that is a number is sent as its digits', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 28),
+    [PROJECT(P1, '28')]: projectPage([projectEntry(2)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P1, '28')]);
+  assert.deepEqual(ids(result.items), [1, 2].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
+});
+
+test('a sidebar cursor that is not a string, a number or empty is a bad page: the sidebar ends, its projects are still read, and the walk is partial', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json({ ...sidebarOf(P1), cursor: {} }),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(3), [SIDEBAR, PROJECT(P1, '0')]);
+  assert.deepEqual(ids(result.items), [chatId(1)]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'sidebar: bad-page' });
+});
+
+test('a project cursor that is not a string, a number or empty is a bad page: that project ends with its chats kept, the next is read, and the walk is partial', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], true),
+    [PROJECT(P2, '0')]: projectPage([projectEntry(2)], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P2, '0')]);
+  assert.deepEqual(ids(result.items), [1, 2].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: bad-page' });
+});
+
+test('a project id is encoded in the path, so a / or ? in it cannot change which URL is asked for', async () => {
+  const encoded = `${API}/gizmos/g-p-a%2Fb%3Fc/conversations?cursor=0`;
+  const fake = run({ ...NOTHING, [SIDEBAR]: json(sidebarOf('g-p-a/b?c')), [encoded]: projectPage([], null) });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [encoded]);
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'whole', reason: 'ok' });
 });
 
 test('a project listed twice on the sidebar is walked once', async () => {
@@ -720,6 +780,38 @@ test('the default page limit is 1000', () => {
   assert.equal(MAX_PAGES, 1000);
 });
 
+test('a project that keeps handing out new cursors and new chats is cut at the page limit, and the next project is still read', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json(sidebarOf(P1, P2)),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], 'c1'),
+    [PROJECT(P1, 'c1')]: projectPage([projectEntry(2)], 'c2'),
+    [PROJECT(P1, 'c2')]: projectPage([projectEntry(3)], 'c3'),
+    [PROJECT(P1, 'c3')]: projectPage([projectEntry(4)], 'c4'),
+    [PROJECT(P2, '0')]: projectPage([projectEntry(5)], null),
+  }, { maxPages: 3 });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(4), [PROJECT(P1, '0'), PROJECT(P1, 'c1'), PROJECT(P1, 'c2'), PROJECT(P2, '0')]);
+  assert.deepEqual(ids(result.items), [1, 2, 3, 5].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'project: page-limit' });
+});
+
+test('a sidebar that keeps handing out new cursors is cut at the page limit, and the projects on the pages read are still walked', async () => {
+  const fake = run({
+    ...NOTHING,
+    [SIDEBAR]: json({ ...sidebarOf(P1), cursor: 's1' }),
+    [SIDEBAR_AT('s1')]: json({ ...sidebarOf(P2), cursor: 's2' }),
+    [SIDEBAR_AT('s2')]: json({ ...sidebarOf(), cursor: 's3' }),
+    [SIDEBAR_AT('s3')]: json({ ...sidebarOf(P3), cursor: 's4' }),
+    [PROJECT(P1, '0')]: projectPage([projectEntry(1)], null),
+    [PROJECT(P2, '0')]: projectPage([projectEntry(2)], null),
+  }, { maxPages: 3 });
+  const result = await fake.result;
+  assert.deepEqual(fake.urls.slice(3), [SIDEBAR, SIDEBAR_AT('s1'), SIDEBAR_AT('s2'), PROJECT(P1, '0'), PROJECT(P2, '0')]);
+  assert.deepEqual(ids(result.items), [1, 2].map(chatId));
+  assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: 'sidebar: page-limit' });
+});
+
 test('a list whose pages bring nothing new three times in a row is cut: its paging is not moving on', async () => {
   const same = page([entry(1), entry(2)]);
   const fake = run({ ...NOTHING, [MAIN(0)]: same, [MAIN(28)]: same, [MAIN(56)]: same, [MAIN(84)]: same, [MAIN(112)]: same });
@@ -925,6 +1017,33 @@ test('a date with no time of day is unreadable: Date.parse reads it, an ISO inst
   const result = await fake.result;
   assert.deepEqual(ids(result.items), [chatId(2)]);
   assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '1 item with an unreadable update_time' });
+});
+
+// The shape check is anchored at both ends. Without either anchor a valid
+// instant with text beside it passes, and DateString prints the whole value
+// when it cannot read it.
+test('a time with text before or after a valid instant is unreadable, and the text reaches no printed line, log, reason or item', async (t) => {
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  for (const value of ['2026-09-08T13:48:43Z SECRET-TITLE', 'SECRET-TITLE 2026-09-08T13:48:43Z']) {
+    const fake = run({
+      ...NOTHING,
+      [MAIN(0)]: page([{ ...entry(1), title: null, update_time: value }, { ...entry(2), title: null, create_time: value }]),
+      [MAIN(28)]: empty(),
+      [SIDEBAR]: json(sidebarOf(P1)),
+      [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(3), title: null, update_time: value }, { ...projectEntry(4), title: null, create_time: value }], null),
+    });
+    const result = await fake.result;
+    // A bad update_time skips the chat and counts it; a bad create_time only gives a null started.
+    assert.deepEqual(ids(result.items), [chatId(2), chatId(4)], value);
+    assert.deepEqual(result.items.map((item) => item.started), [null, null], value);
+    assert.deepEqual({ outcome: result.outcome, reason: result.reason }, { outcome: 'partial', reason: '2 items with an unreadable update_time' }, value);
+    for (const line of [...printed, ...fake.logs, result.reason, JSON.stringify(result.items)]) {
+      assert.ok(!line.includes('SECRET-TITLE'), `"${line}" shows the text beside the time`);
+    }
+  }
 });
 
 test('a walk with a log that throws still ends in a result', async () => {
