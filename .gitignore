@@ -145,6 +145,9 @@ build/
 playwright-report/
 test-results/
 
+# Bundles that tests/scripts/build-test-bundle.js writes into the test extension
+tests/extension/js/
+
 tests/node_modules/
 tests/list-utilities.bundle.js
 tests/list-utilities.bundle.js.map

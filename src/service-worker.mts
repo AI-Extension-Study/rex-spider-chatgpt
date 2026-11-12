@@ -1,9 +1,9 @@
 import check from 'check-types'
 
-import { Conversation, Turn, DateString, Citation, Search } from '@bric/rex-types/types'
+import { type Conversation, type Turn, DateString, type Citation, type Search } from '@bric/rex-types/types'
 
-import { EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
-import rexSpiderPlugin, { REXSpider, REXSpiderCrawlResult, REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
+import { type EventPayload, dispatchEvent } from '@bric/rex-core/service-worker'
+import rexSpiderPlugin, { REXSpider, type REXSpiderCrawlResult, type REXSpiderCrawlInspection } from '@bric/rex-spider/service-worker'
 
 export class REXChatGPTSpider extends REXSpider {
   accessToken: string | null = null
