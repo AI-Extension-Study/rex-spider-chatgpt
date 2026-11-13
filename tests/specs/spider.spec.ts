@@ -3,8 +3,9 @@
 // The spider as the extension loads it, in a real service worker: the module
 // registers one ChatGPT spider with rex-spider, the spider's flags follow
 // every configuration update both ways, and the keys the spider writes sit
-// under rex-spider's namespace for it. A crawl against a mocked chatgpt.com
-// is a later spec.
+// under rex-spider's namespace for it. The one crawl here answers chatgpt.com
+// inside the worker, so one log holds its requests and keep-alive calls in
+// order; crawl.spec.ts runs the crawls with chatgpt.com answered by a route.
 import { test, expect } from './fixtures'
 
 test('the module registers one ChatGPT spider with rex-spider', async ({ serviceWorker }) => {
