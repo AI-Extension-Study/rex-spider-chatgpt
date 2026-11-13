@@ -71,6 +71,10 @@ async function crawl(serviceWorker) {
     })
   })
   await expect.poll(() => serviceWorker.evaluate(() => self.rexChatGPTPlugin.isCrawling())).toBe(false)
+  // Nothing a round dispatches holds text from a chat, a summary sent in a
+  // failed read's place included: every title and text of the site carries
+  // MARK.
+  expect(JSON.stringify(round.events)).not.toContain(MARK)
   return round
 }
 
