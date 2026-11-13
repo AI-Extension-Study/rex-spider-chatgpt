@@ -45,18 +45,28 @@ export async function resendSince(store: Pick<ChatGPTStore, 'mode'>, served: Mod
 // again.
 export type Transmitted = (id: string, ended: DateString) => Promise<boolean>;
 
-// Whether a chat in the crawl window needs nothing this pass: it was sent in
-// the served mode at this time, or sent in the other mode at this time and
-// last used more than RESEND_WINDOW_MS before the switch. The time is the one
-// its upload key is built from (list.mts, uploadTime). With no start for this
-// pass (since null), a chat sent in the other mode is held back rather than
-// sent.
-export async function sentAlready(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null): Promise<boolean> {
+// What a chat in the crawl window needs this pass. sent: it was sent in the
+// served mode at this time, or sent in the other mode at this time and last
+// used more than RESEND_WINDOW_MS before the switch. due: it is to be sent.
+// held: it was sent in the other mode, and with no start for this pass (since
+// null) it is held back rather than sent. The time is the one its upload key
+// is built from (list.mts, uploadTime).
+export type Need = 'sent' | 'due' | 'held';
+
+export async function dueState(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null): Promise<Need> {
   if (await transmitted(uploadKeyId(chatId, served === 'summary'), ended)) {
-    return true;
+    return 'sent';
   }
   if (!(await transmitted(uploadKeyId(chatId, served !== 'summary'), ended))) {
-    return false;
+    return 'due';
   }
-  return since === null || ended.timestamp() < since - RESEND_WINDOW_MS;
+  if (since === null) {
+    return 'held';
+  }
+  return ended.timestamp() < since - RESEND_WINDOW_MS ? 'sent' : 'due';
+}
+
+// Whether a chat in the crawl window needs nothing this pass: sent, or held.
+export async function sentAlready(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null): Promise<boolean> {
+  return (await dueState(transmitted, chatId, ended, served, since)) !== 'due';
 }

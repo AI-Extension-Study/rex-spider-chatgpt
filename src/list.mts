@@ -260,12 +260,14 @@ const timer = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const defaultLog = (line: string) => console.log(`[rex-spider-chatgpt] ${line}`);
 
 // crawl_delay comes from the served config as it was written. A number or a
-// numeric string is read as it is (0 too); anything else is the default.
-function delayOf(pace: Pace): number {
-  const given: unknown = pace.crawlDelay();
+// numeric string is read as it is (0 too); anything else is the default. The
+// pass reads it the same way between its own requests.
+export function crawlDelayMs(given: unknown): number {
   const ms = typeof given === 'number' ? given : typeof given === 'string' && given.trim() !== '' ? Number(given) : Number.NaN;
   return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_CRAWL_DELAY_MS;
 }
+
+const delayOf = (pace: Pace): number => crawlDelayMs(pace.crawlDelay());
 
 interface Failure {
   readonly reason: string;
