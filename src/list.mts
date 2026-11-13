@@ -189,8 +189,8 @@ function instant(value: unknown): DateString | null {
   if (typeof value !== 'string' || !ISO_INSTANT.test(value) || !namesInstant(value)) {
     return null;
   }
-  const read = new DateString(value);
-  return read.value === null ? null : read;
+  // DateString reads it with the same Temporal, so its value is never null.
+  return new DateString(value);
 }
 
 // The forms of ListMeta. A time is kept as the list sent it when the walk can
