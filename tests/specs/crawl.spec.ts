@@ -110,6 +110,14 @@ async function uploadKeys(serviceWorker) {
   }))
 }
 
+// What rex-core holds under a key, as it answers a fetchValue: null when
+// nothing is stored.
+async function storedValue(serviceWorker, key: string) {
+  return serviceWorker.evaluate((key) => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'fetchValue', key }, null, resolve)
+  }), key)
+}
+
 // The upload key rex-spider builds for an id and a list time, from its own
 // fetchUploadKey (private in its types, a method at run time), the time read
 // as the spider before this rewrite read it on each list path: the list's
@@ -275,5 +283,66 @@ test('enabled false served through a configuration refresh between two detail re
   // The record that went out before the switch-off keeps its key.
   expect(await uploadKeys(serviceWorker)).toEqual([uploadKey(`${chat(1)}-detail`, Date.parse(site.main[0].update_time))])
   expect(await serviceWorker.evaluate(() => self.rexChatGPTPlugin.isEnabled())).toBe(false)
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// The switch rule: after summarize changes, the chats last used in the 90
+// days before the switch go out once more in the new mode, and older ones
+// keep the record they have. A chat with no key in either mode goes out in
+// the served mode. The switch is dated by the first crawl in this browser
+// that runs the new mode, kept in the mode record.
+test('summarize served true, then false, then true: each switch re-sends, in the new mode, only the chats last used in the 90 days before it', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(90_000)
+  const now = Date.now()
+  const site = new Site()
+  site.main.push(mainItem(chat(1), now - HOUR_MS), mainItem(chat(2), daysAgo(100, now)))
+  for (const n of [1, 2, 3, 4]) site.details.set(chat(n), simpleDetail(chat(n)))
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  const sentIn = (round) => records(round.events).map((record) => [record.identifier, record.is_summary ? 'summary' : 'detail'])
+  // The mode record after a crawl: its mode, and whether its start is that crawl's.
+  const modeOf = async (from: number) => {
+    const record = await storedValue(serviceWorker, 'rex-spider-chatgpt-mode')
+    return [record.mode, record.since >= from && record.since <= Date.now()]
+  }
+
+  await serve(serviceWorker, { summarize: true })
+  let from = Date.now()
+  const first = await crawl(serviceWorker)
+  expect(sentIn(first)).toEqual([[chat(1), 'summary'], [chat(2), 'summary']])
+  expect(completions(first.events)).toEqual([[2, [chat(1), chat(2)], reason('ok seen=2 dispatched=2')]])
+  expect(await modeOf(from)).toEqual(['summary', true])
+
+  // Two chats that crawl never saw, used two hours and 120 days ago.
+  site.main.push(mainItem(chat(3), now - 2 * HOUR_MS), mainItem(chat(4), daysAgo(120, now)))
+  await serve(serviceWorker, { summarize: false })
+  from = Date.now()
+  site.calls.splice(0)
+  const second = await crawl(serviceWorker)
+  // Chat 1 goes out again in detail. Chat 2, last used 100 days before the
+  // switch, keeps its summary. Chats 3 and 4 have no key, so they go out.
+  expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(1)}`, `GET detail ${chat(3)}`, `GET detail ${chat(4)}`])
+  expect(sentIn(second)).toEqual([[chat(1), 'detail'], [chat(3), 'detail'], [chat(4), 'detail']])
+  expect(completions(second.events)).toEqual([[3, [chat(1), chat(3), chat(2), chat(4)], reason('ok seen=4 dispatched=3')]])
+  expect(await modeOf(from)).toEqual(['detail', true])
+
+  await serve(serviceWorker, { summarize: true })
+  from = Date.now()
+  site.calls.splice(0)
+  const third = await crawl(serviceWorker)
+  // Back to summary: chat 3, sent only in detail two hours before the switch,
+  // goes out as a summary. Chat 4, last used 120 days before it, keeps its
+  // detail record, and chats 1 and 2 hold summary keys already.
+  expect(site.calls).toEqual(listWalk())
+  expect(sentIn(third)).toEqual([[chat(3), 'summary']])
+  expect(completions(third.events)).toEqual([[1, [chat(1), chat(3), chat(2), chat(4)], reason('ok seen=4 dispatched=1')]])
+  expect(await modeOf(from)).toEqual(['summary', true])
+
+  // Each chat's keys as stored, one for each mode it went out in.
+  const at = (n: number) => Date.parse(site.main.find((item) => item.id === chat(n)).update_time)
+  expect(await uploadKeys(serviceWorker)).toEqual([
+    uploadKey(chat(1), at(1)), uploadKey(`${chat(1)}-detail`, at(1)), uploadKey(chat(2), at(2)),
+    uploadKey(chat(3), at(3)), uploadKey(`${chat(3)}-detail`, at(3)), uploadKey(`${chat(4)}-detail`, at(4)),
+  ].sort())
   await expectAllRouted(serviceWorker, site, unrouted)
 })
