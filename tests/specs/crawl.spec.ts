@@ -438,3 +438,40 @@ test('a 429 with Retry-After on a detail stops the pass and stores the wait; a c
   expect(await storedValue(serviceWorker, 'rex-spider-chatgpt-backoff')).toBeNull()
   await expectAllRouted(serviceWorker, site, unrouted)
 })
+
+// An access token can expire during a long pass. The API then answers 401:
+// the pass ends as signed out, with no back-off and no summary in place of
+// the read, and the next crawl reads a new token from the home page.
+test('a token that expires between two detail reads ends the pass as signed out, with no back-off, and the next crawl reads a new token and the chats left', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const now = Date.now()
+  const site = new Site()
+  for (const n of [1, 2, 3]) {
+    site.main.push(mainItem(chat(n), now - n * HOUR_MS))
+    site.details.set(chat(n), simpleDetail(chat(n)))
+  }
+  // The first token stops working just before the second detail read.
+  site.beforeDetail = async (id) => {
+    if (id === chat(2) && site.tokens.length === 1) site.expired.add(site.tokens[0])
+  }
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker)
+
+  const first = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual([...listWalk(), `GET detail ${chat(1)}`, `GET detail ${chat(2)} 401`])
+  expect(records(first.events).map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), false]])
+  expect(completions(first.events)).toEqual([[1, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=1 left=2 stop=not-signed-in')]])
+  expect(first.result.issues).toEqual([])
+  expect(await storedValue(serviceWorker, 'rex-spider-chatgpt-backoff')).toBeNull()
+  expect(await storedValue(serviceWorker, `rex-spider-chatgpt-detail-memo-${chat(2)}`)).toBeNull()
+
+  // The first token no longer works, so every answer of this crawl was to
+  // the second.
+  const second = await crawl(serviceWorker)
+  expect(site.tokens).toHaveLength(2)
+  expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(2)}`, `GET detail ${chat(3)}`])
+  expect(records(second.events).map((record) => [record.identifier, record.is_summary])).toEqual([[chat(2), false], [chat(3), false]])
+  expect(completions(second.events)).toEqual([[2, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=2')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
