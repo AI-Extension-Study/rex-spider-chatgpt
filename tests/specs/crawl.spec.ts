@@ -11,13 +11,16 @@
 import crypto from 'node:crypto'
 
 import { test, expect } from './fixtures'
-import { MARK, ROUTE_NAME, Site, answerChatGPT, daysAgo, mainItem, projectChat } from './chatgpt-site'
+import {
+  MARK, ROUTE_NAME, Site, answerChatGPT, attachmentsChat, daysAgo, editedChat, mainItem, projectChat, reasoningChat,
+} from './chatgpt-site'
 import { checkRecord } from './standard-check'
 
 const chat = (n: number) => `6911f0a5-2222-8000-8000-${String(n).padStart(12, '0')}`
 const PROJECT = 'g-p-0000000000000000000000000000aaaa'
 const HOUR_MS = 60 * 60 * 1000
 const sha256 = (text: string) => crypto.createHash('sha256').update(text).digest('hex')
+const uploadKey = (id: string, ms: number) => `rex-spider-chatgpt-conversation-upload-${id}-${ms}`
 
 // rex-core answers store messages only once its database is open; a crawl
 // started before then would end on its storage deadlines.
@@ -196,5 +199,51 @@ test('served the study\'s window anchored at install, a summary crawl sends the 
   expect(sent.map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), true], [chat(2), true]])
   expect(sent.flatMap((record) => checkRecord(record, MARK))).toEqual([])
   expect(completions(round.events)).toEqual([[2, [chat(1), chat(2)], reason('ok seen=2 dispatched=2')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// Detail reads are at least 3 s apart (the settle wait), so a spec that reads
+// several gets more time.
+test('served no summarize, a crawl reads each chat and sends detail records that meet the shared layout, keyed -detail at the list time, and the next crawl sends none', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const site = new Site()
+  site.main.push(mainItem(chat(1), Date.parse('2026-09-10T08:00:00.500Z')), mainItem(chat(2), Date.parse('2026-09-09T08:00:00.250Z')), mainItem(chat(3), Date.parse('2026-09-08T13:49:43.781Z')))
+  site.details.set(chat(1), reasoningChat(chat(1)))
+  site.details.set(chat(2), editedChat(chat(2)))
+  site.details.set(chat(3), attachmentsChat(chat(3)))
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker)
+
+  const first = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual([...listWalk(), `GET detail ${chat(1)}`, `GET detail ${chat(2)}`, `GET detail ${chat(3)}`])
+  const sent = records(first.events)
+  expect(sent.map((record) => [record.identifier, record.is_summary, record.turns_complete])).toEqual([[chat(1), false, true], [chat(2), false, true], [chat(3), false, true]])
+  expect(sent.flatMap((record) => checkRecord(record, MARK))).toEqual([])
+  // What the worker counted on each tree: the speaker, whether the turn is on
+  // the current branch, characters, words, citations, search results and
+  // attachments.
+  const counted = (record) => record.turns.map((turn) => [turn.speaker, turn.on_current_branch, turn.text_chars, turn.text_words, turn.citation_count, turn.search_result_count, turn.attachments])
+  // A reasoning reply is one turn: its two visible texts, two cited passages,
+  // and the five results of its search.
+  expect(counted(sent[0])).toEqual([['user', true, 20, 4, 0, 0, 0], ['assistant', true, 36, 7, 2, 5, 0]])
+  // An edited first prompt: the old prompt and its reply are off the branch.
+  expect(counted(sent[1]).map(([speaker, branch]) => [speaker, branch])).toEqual([['user', false], ['assistant', false], ['user', true], ['assistant', true]])
+  // Two images are two attachments, and no text.
+  expect(counted(sent[2])[0]).toEqual(['user', true, 20, 4, 0, 0, 2])
+  expect(completions(first.events)).toEqual([[3, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=3')]])
+
+  // The keys as stored: the chat id with -detail and the list's time, never
+  // the record's ended, each the key rex-spider builds for it.
+  const keys = [uploadKey(`${chat(1)}-detail`, 1789027200500), uploadKey(`${chat(2)}-detail`, 1788940800250), uploadKey(`${chat(3)}-detail`, 1788875383781)]
+  expect(await uploadKeys(serviceWorker)).toEqual([...keys].sort())
+  const built = []
+  for (const item of site.main) built.push(await rexSpiderKey(serviceWorker, `${item.id}-detail`, item.update_time))
+  expect(built).toEqual(keys)
+
+  const second = await crawl(serviceWorker)
+  expect(site.calls).toEqual(listWalk())
+  expect(records(second.events)).toEqual([])
+  expect(completions(second.events)).toEqual([[0, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=0')]])
   await expectAllRouted(serviceWorker, site, unrouted)
 })
