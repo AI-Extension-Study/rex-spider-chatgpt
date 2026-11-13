@@ -10,7 +10,8 @@
 // and an unanswered write as failed, and both say so to the caller.
 import type rexCorePlugin from '@bric/rex-core/service-worker';
 
-import { MODE_KEY, keyKind, memoKey } from './keys.mts';
+import { type BackoffState, isBackoffState } from './backoff.mts';
+import { BACKOFF_KEY, MODE_KEY, keyKind, memoKey } from './keys.mts';
 
 export type HandleMessage = typeof rexCorePlugin.handleMessage;
 
@@ -58,6 +59,11 @@ export interface ChatGPTStore {
   readonly mode: {
     get(): Promise<Read<ModeRecord>>;
     set(record: ModeRecord): Promise<Write>;
+  };
+  // null clears it.
+  readonly backoff: {
+    get(): Promise<Read<BackoffState>>;
+    set(state: BackoffState | null): Promise<Write>;
   };
   readonly memo: {
     get(chatId: string): Promise<Read<DetailMemo>>;
@@ -151,6 +157,11 @@ export function createStore(handleMessage: HandleMessage, { deadlineMs = STORE_D
     mode: {
       get: () => typed(MODE_KEY, isModeRecord),
       set: (record) => set(MODE_KEY, record),
+    },
+    // rex-core has no delete; null reads back as nothing.
+    backoff: {
+      get: () => typed(BACKOFF_KEY, isBackoffState),
+      set: (state) => set(BACKOFF_KEY, state),
     },
     // async, so that a bad chat id rejects rather than throws.
     memo: {

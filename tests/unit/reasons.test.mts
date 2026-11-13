@@ -39,7 +39,7 @@ test('the stops are the closed set the pass can end its sending with', () => {
   }
 });
 
-test('every code can be written, and what comes out holds only lowercase names, digits and the separators', () => {
+test('every code can be written, and what comes out holds only lowercase names, digits, ISO times and the separators', () => {
   const samples: Record<string, Record<string, unknown>> = {
     ok: { seen: 1, dispatched: 1, ms: 1 },
     partial: { seen: 1, dispatched: 1, ms: 1 },
@@ -53,10 +53,20 @@ test('every code can be written, and what comes out holds only lowercase names, 
     disabled: { stage: 'start', ms: 1 },
     store: { ms: 1 },
     internal: { stage: 'list', ms: 1 },
+    backoff: { until: Date.UTC(2026, 10, 20), code: 'challenge' },
   };
   assert.deepEqual([...REASON_CODES].sort(), Object.keys(samples).sort());
   for (const code of REASON_CODES) {
     const reason = formatReason(code, samples[code] as never);
-    assert.match(reason, /^[a-z-]+( [a-z-]+=[a-z0-9-]+)+$/, reason);
+    // An ISO time is the one value with capitals, colons and a point.
+    assert.match(reason, /^[a-z-]+( [a-z-]+=([a-z0-9-]+|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z))+$/, reason);
   }
+});
+
+test('a skipped pass names when its back-off runs out, as an ISO time, and what asked for it', () => {
+  assert.equal(formatReason('backoff', { until: Date.UTC(2026, 10, 20, 12, 5), code: 'rate-limited' }), 'backoff until=2026-11-20T12:05:00.000Z code=rate-limited');
+  assert.equal(formatReason('backoff', { until: new Date(Date.UTC(2026, 10, 20, 12, 5)), code: 'challenge' }), 'backoff until=2026-11-20T12:05:00.000Z code=challenge');
+  assert.throws(() => formatReason('backoff', { until: Number.NaN, code: 'rate-limited' }), /until/);
+  assert.throws(() => formatReason('backoff', { until: 'tomorrow' as never, code: 'rate-limited' }), /until/);
+  assert.throws(() => formatReason('backoff', { until: 1, code: 'provider-refused' as never }), /code/);
 });

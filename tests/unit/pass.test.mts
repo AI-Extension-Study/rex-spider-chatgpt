@@ -6,8 +6,9 @@ import { DateString } from '@bric/rex-types/types';
 
 import { type Answer, RequestError } from '../../src/client.mts';
 import { PASS_LIMITS, type PassFramework, type PassLimits, type PassOutcome, runPass } from '../../src/pass.mts';
+import { type BackoffState } from '../../src/backoff.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
-import { type ModeRecord, type Read, type Write } from '../../src/store.mts';
+import { type DetailMemo, type ModeRecord, type Read, type Write } from '../../src/store.mts';
 import { MARK, ROOT, T0, answer, detail, listItem, nodeId, projectItem, prompt, tree } from './fixtures.mts';
 
 type Json = Record<string, unknown>;
@@ -183,24 +184,76 @@ function rexSpider(options: SideOptions = {}) {
   return { framework, keys, stamps, lookups };
 }
 
-// rex-core's store as the pass sees it (store.mts): the mode record.
-// unanswered: its reads get no answer; unkept: its writes fail.
-function rexCore({ mode = null as ModeRecord | null, unanswered = false, unkept = false, onRead = () => {} } = {}) {
-  const held = { mode };
+interface CoreOptions {
+  readonly mode?: ModeRecord | null;
+  // The mode record's reads get no answer, or its writes fail.
+  readonly unanswered?: boolean;
+  readonly unkept?: boolean;
+  readonly onRead?: () => void;
+  readonly memos?: Readonly<Record<string, DetailMemo>>;
+  // Chats whose memo reads get no answer, or hold something that is not a memo.
+  readonly memoUnanswered?: readonly string[];
+  readonly memoMalformed?: readonly string[];
+  // Memo writes fail.
+  readonly memoUnkept?: boolean;
+  readonly backoff?: BackoffState | null;
+  readonly backoffUnanswered?: boolean;
+}
+
+// rex-core's store as the pass sees it (store.mts): the mode record, the
+// memos of failed detail reads, and the back-off.
+function rexCore(options: CoreOptions = {}) {
+  const held = { mode: options.mode ?? null, backoff: options.backoff ?? null };
   const writes: ModeRecord[] = [];
+  const memos = new Map(Object.entries(options.memos ?? {}));
+  const memoWrites: [string, DetailMemo][] = [];
+  const memoClears: string[] = [];
+  const backoffWrites: (BackoffState | null)[] = [];
+  const malformed = new Set(options.memoMalformed ?? []);
   return {
     held,
     writes,
+    memos,
+    memoWrites,
+    memoClears,
+    backoffWrites,
     store: {
       mode: {
         get: async (): Promise<Read<ModeRecord>> => {
-          onRead();
-          return { value: unanswered ? null : held.mode, unanswered, malformed: false };
+          options.onRead?.();
+          return { value: options.unanswered === true ? null : held.mode, unanswered: options.unanswered === true, malformed: false };
         },
         set: async (record: ModeRecord): Promise<Write> => {
           writes.push(record);
-          if (unkept) return { ok: false, unanswered: false };
+          if (options.unkept === true) return { ok: false, unanswered: false };
           held.mode = record;
+          return { ok: true, unanswered: false };
+        },
+      },
+      memo: {
+        get: async (chatId: string): Promise<Read<DetailMemo>> => {
+          if (options.memoUnanswered?.includes(chatId) === true) return { value: null, unanswered: true, malformed: false };
+          if (malformed.has(chatId)) return { value: null, unanswered: false, malformed: true };
+          return { value: memos.get(chatId) ?? null, unanswered: false, malformed: false };
+        },
+        set: async (chatId: string, memo: DetailMemo): Promise<Write> => {
+          memoWrites.push([chatId, memo]);
+          if (options.memoUnkept === true) return { ok: false, unanswered: false };
+          memos.set(chatId, memo);
+          return { ok: true, unanswered: false };
+        },
+        clear: async (chatId: string): Promise<Write> => {
+          memoClears.push(chatId);
+          memos.delete(chatId);
+          malformed.delete(chatId);
+          return { ok: true, unanswered: false };
+        },
+      },
+      backoff: {
+        get: async (): Promise<Read<BackoffState>> => ({ value: options.backoffUnanswered === true ? null : held.backoff, unanswered: options.backoffUnanswered === true, malformed: false }),
+        set: async (state: BackoffState | null): Promise<Write> => {
+          backoffWrites.push(state);
+          held.backoff = state;
           return { ok: true, unanswered: false };
         },
       },
@@ -269,7 +322,6 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
       },
     },
     store: {
-      ...core.store,
       mode: {
         get: () => {
           trace.push('mode get');
@@ -278,6 +330,30 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
         set: (record) => {
           trace.push('mode set');
           return core.store.mode.set(record);
+        },
+      },
+      memo: {
+        get: (chatId) => {
+          trace.push(`memo get ${chatId}`);
+          return core.store.memo.get(chatId);
+        },
+        set: (chatId, memo) => {
+          note(`memo ${chatId}`);
+          return core.store.memo.set(chatId, memo);
+        },
+        clear: (chatId) => {
+          note(`clear ${chatId}`);
+          return core.store.memo.clear(chatId);
+        },
+      },
+      backoff: {
+        get: () => {
+          trace.push('backoff get');
+          return core.store.backoff.get();
+        },
+        set: (state) => {
+          trace.push('backoff set');
+          return core.store.backoff.set(state);
         },
       },
     },
@@ -665,13 +741,15 @@ test('a hash that never answers gives null hashes, and the records still go out'
   assert.equal(read.sent[0].is_summary, false);
 });
 
-test('a detail that gives no record sends nothing for its chat and stamps no key', async () => {
+test('a detail that gives no record is a detail that cannot be read: its summary goes out in its place, and it gets no detail key', async () => {
   // A detail of another chat, which the record builder refuses.
   const web = site({ main: [listed(1, 1), listed(2, 2)], details: { [chat(1)]: json(chatDetail(chat(9))) } });
-  const side = rexSpider();
-  const run = await pass(web, side);
-  assert.deepEqual(run.sent.map((record) => record.identifier).includes(chat(1)), false);
-  assert.equal(side.stamps.some((key) => key.startsWith(chat(1))), false);
+  const side = rexSpider({ halt: false });
+  const core = rexCore();
+  const run = await pass(web, side, { core });
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chat(1), true], [chat(2), false]]);
+  assert.deepEqual(side.stamps, [keyOf(2, 2, 'detail')]);
+  assert.deepEqual(core.memoWrites.map(([id, memo]) => [id, memo.retryMs]), [[chat(1), 7 * DAY]]);
 });
 
 // A builder that throws on one chat's detail (no input is known to make the
@@ -681,10 +759,14 @@ const throwsOn = (id: string): typeof buildDetailRecord => async (json, item, ha
   return buildDetailRecord(json, item, hash);
 };
 
-test('a record builder that throws on a chat\'s detail fails that read, and does not end the pass as an internal error', async () => {
-  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), rexSpider(), { detailBuilder: throwsOn(chat(1)) });
-  assert.deepEqual(detailsOf(run.events), [chat(1)]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=0 failed=1 left=2 stop=failed-reads');
+test('a record builder that throws on a chat\'s detail is a detail that cannot be read: its summary and a 7-day memo, and the next chat is read', async () => {
+  const side = rexSpider({ halt: false });
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), side, { core, detailBuilder: throwsOn(chat(1)) });
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2)]);
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary]), [[chat(1), true], [chat(2), false]]);
+  assert.deepEqual(core.memoWrites.map(([id, memo]) => [id, memo.retryMs, memo.failures]), [[chat(1), 7 * DAY, 1]]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=2 failed=1');
 });
 
 test('a wait that rejects ends the pass with a reason, and runPass does not throw', async () => {
@@ -719,5 +801,267 @@ test('a switch-off before the pass starts sends no request', async () => {
   const web = site({ main: [listed(1, 1)] });
   const run = await pass(web, rexSpider({ enabled: false }));
   assert.deepEqual(web.requests, []);
+  assert.equal(withoutMs(run.outcome.reason), 'disabled stage=start');
+});
+
+// The failure policy. The arms serve halt_on_error false, so these do too
+// unless a test is about it.
+const MINUTE = 60_000;
+const SOON = DAY;
+const LATE = 7 * DAY;
+const failing = (status: number, headers: Record<string, string> = {}): Answer => json({ detail: `${MARK} refused` }, status, headers);
+const CHALLENGE: Answer = { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: `<html>${MARK} checking your browser</html>` };
+const summariesOf = (sent: readonly Json[]) => sent.map((record) => [record.identifier, record.is_summary]);
+
+test('a 429 with Retry-After: 120 on a detail stops the pass, stores a back-off of at least 120 s, and sends nothing for that chat', async () => {
+  const lists = { main: [listed(1, 1), listed(2, 2), listed(3, 3)] };
+  const side = rexSpider({ halt: false });
+  const core = rexCore();
+  const run = await pass(site({ ...lists, details: { [chat(2)]: failing(429, { 'retry-after': '120' }) } }), side, { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2)]);
+  assert.deepEqual(summariesOf(run.sent), [[chat(1), false]]);
+  assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail')]);
+  assert.deepEqual(core.memoWrites, []);
+  assert.equal(core.backoffWrites.length, 1);
+  const stored = core.backoffWrites[0] as BackoffState;
+  assert.deepEqual([stored.code, stored.failures], ['rate-limited', 1]);
+  assert.ok(stored.until - run.clock() >= 120_000);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=1 left=2 stop=rate-limited');
+  // A minute later the pass is skipped with no request.
+  const skipped = site(lists);
+  const next = await pass(skipped, side, { core, now: run.clock() + MINUTE });
+  assert.deepEqual(skipped.requests, []);
+  assert.deepEqual(next.outcome, { count: -1, ids: [], reason: `backoff until=${new Date(stored.until).toISOString()} code=rate-limited` });
+  // Once it has run out, the chat is read, and the clean pass clears the back-off.
+  const after = await pass(site(lists), side, { core, now: stored.until });
+  assert.deepEqual(detailsOf(after.events), [chat(2), chat(3)]);
+  assert.deepEqual(core.backoffWrites, [stored, null]);
+});
+
+test('a Retry-After longer than the schedule sets the wait', async () => {
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1)], details: { [chat(1)]: failing(429, { 'retry-after': '3600' }) } }), rexSpider({ halt: false }), { core });
+  assert.equal((core.held.backoff as BackoffState).until - run.clock(), 60 * MINUTE);
+});
+
+test('a 503, and a challenge answered with cf-mitigated, stop the pass the same way', async () => {
+  const cases: [Answer, string][] = [[failing(503), 'rate-limited'], [CHALLENGE, 'challenge']];
+  for (const [refusal, code] of cases) {
+    const core = rexCore();
+    const run = await pass(site({ main: [listed(1, 1), listed(2, 2)], details: { [chat(1)]: refusal } }), rexSpider({ halt: false }), { core });
+    assert.deepEqual(detailsOf(run.events), [chat(1)], code);
+    assert.deepEqual(run.sent, [], code);
+    assert.deepEqual(core.memoWrites, [], code);
+    assert.deepEqual(core.backoffWrites.map((state) => [state?.code, state?.failures]), [[code, 1]], code);
+    assert.equal(withoutMs(run.outcome.reason), `ok seen=2 dispatched=0 left=2 stop=${code}`, code);
+  }
+});
+
+test('a refusal at the home page or a list sets the back-off too, and each refusal in a row doubles the wait', async () => {
+  const core = rexCore();
+  const side = rexSpider();
+  const first = await pass(site({ home: failing(429) }), side, { core });
+  assert.equal(withoutMs(first.outcome.reason), 'rate-limited stage=home status=429');
+  assert.equal((core.held.backoff as BackoffState).until - first.clock(), 5 * MINUTE);
+  const second = await pass(site({ main: [listed(1, 1)], failing: { main: failing(429, { 'retry-after': '60' }) } }), side, { core, now: (core.held.backoff as BackoffState).until });
+  assert.equal(withoutMs(second.outcome.reason), 'rate-limited stage=list retry-after=60');
+  assert.deepEqual([(core.held.backoff as BackoffState).failures, (core.held.backoff as BackoffState).until - second.clock()], [2, 10 * MINUTE]);
+  const third = await pass(site({ home: CHALLENGE }), side, { core, now: (core.held.backoff as BackoffState).until });
+  assert.equal(withoutMs(third.outcome.reason), 'challenge stage=home status=403');
+  assert.deepEqual([(core.held.backoff as BackoffState).code, (core.held.backoff as BackoffState).failures], ['challenge', 3]);
+});
+
+test('a 401 on a detail ends the pass as signed out, with no back-off, and the next pass reads a new token from the home page', async () => {
+  const lists = { main: [listed(1, 1), listed(2, 2)] };
+  const side = rexSpider({ halt: false });
+  const core = rexCore();
+  const run = await pass(site({ ...lists, details: { [chat(1)]: failing(401) } }), side, { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(run.sent, []);
+  assert.deepEqual(core.memoWrites, []);
+  assert.deepEqual(core.backoffWrites, []);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=0 left=2 stop=not-signed-in');
+  const fresh = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJuZXcifQ.bmV3LXRva2Vu';
+  const next = site({ ...lists, home: homePage(fresh) });
+  const again = await pass(next, side, { core });
+  assert.equal(next.homes.count, 1);
+  assert.ok(next.requests.slice(1).every((request) => request.token === fresh));
+  assert.deepEqual(detailsOf(again.events), [chat(1), chat(2)]);
+});
+
+test('a 401 or no token at the home page, and a 401 on a list, set no back-off either', async () => {
+  for (const options of [{ home: failing(401) }, { home: { status: 200, headers: {}, text: '<html></html>' } }, { main: [listed(1, 1)], failing: { main: failing(401) } }] as SiteOptions[]) {
+    const core = rexCore();
+    await pass(site(options), rexSpider(), { core });
+    assert.deepEqual(core.backoffWrites, []);
+  }
+});
+
+test('a 403 on one chat writes its memo and sends its summary in its place, and the next chat is read', async () => {
+  const side = rexSpider({ halt: false });
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2), listed(3, 3)], details: { [chat(1)]: failing(403) } }), side, { core });
+  assert.deepEqual(run.events.slice(run.events.indexOf(`GET detail ${chat(1)}`)), [
+    `GET detail ${chat(1)}`, `dispatch ${chat(1)}`, 'wait 30000', `memo ${chat(1)}`,
+    `GET detail ${chat(2)}`, `dispatch ${chat(2)}`, 'wait 30000', `stamp ${chat(2)}-detail`,
+    `GET detail ${chat(3)}`, `dispatch ${chat(3)}`, 'wait 3000', `stamp ${chat(3)}-detail`,
+  ]);
+  assert.deepEqual(summariesOf(run.sent), [[chat(1), true], [chat(2), false], [chat(3), false]]);
+  // The summary in the detail's place gets no key, so the chat's detail is read again when its memo runs out.
+  assert.deepEqual(side.stamps, [keyOf(2, 2, 'detail'), keyOf(3, 3, 'detail')]);
+  const [[id, memo]] = core.memoWrites;
+  assert.deepEqual([id, memo.ended, memo.retryMs, memo.failures], [chat(1), mainKeyMs(listTime(NOW - DAY)), LATE, 1]);
+  assert.ok(memo.at > NOW && memo.at < run.clock());
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=3 failed=1');
+});
+
+test('a detail that cannot be read sends the summary in its place, with a memo of 1 day for an answer that may pass and 7 days otherwise', async () => {
+  const cases: [string, Reply, number][] = [
+    ['a 500', failing(500), SOON],
+    ['a 502', failing(502), SOON],
+    ['no answer in time', () => { throw new RequestError('timeout'); }, SOON],
+    ['a dropped connection', () => { throw new RequestError('network'); }, SOON],
+    ['a 200 page that is not JSON', { status: 200, headers: {}, text: `<html>${MARK}</html>` }, SOON],
+    ['a 404', failing(404), LATE],
+    ['a 403', failing(403), LATE],
+    ['another chat\'s detail', json(chatDetail(chat(9))), LATE],
+    ['a detail with no tree', json({ conversation_id: chat(1), title: `${MARK} title` }), LATE],
+  ];
+  for (const [what, reply, retryMs] of cases) {
+    const side = rexSpider({ halt: false });
+    const core = rexCore();
+    const run = await pass(site({ main: [listed(1, 1)], details: { [chat(1)]: reply } }), side, { core });
+    assert.deepEqual(summariesOf(run.sent), [[chat(1), true]], what);
+    assert.deepEqual(side.stamps, [], what);
+    assert.deepEqual(core.memoWrites.map(([chatId, memo]) => [chatId, memo.ended, memo.retryMs, memo.failures]), [[chat(1), mainKeyMs(listTime(NOW - DAY)), retryMs, 1]], what);
+    assert.deepEqual(core.backoffWrites, [], what);
+    assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1 failed=1', what);
+  }
+});
+
+test('the summary does not go out in a failed read\'s place when one went out at that time, and the memo is still written', async () => {
+  // Sent as a summary 10 days ago, before the switch to detail, so re-sent in detail; the read fails.
+  const side = rexSpider({ halt: false, keys: [keyOf(1, 10, 'summary')] });
+  const core = rexCore({ mode: { mode: 'summary', since: NOW - 200 * DAY } });
+  const run = await pass(site({ main: [listed(1, 10)], details: { [chat(1)]: failing(500) } }), side, { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(run.sent, []);
+  assert.deepEqual(core.memoWrites.map(([chatId]) => chatId), [chat(1)]);
+});
+
+test('a memo holds its chat back until its retry time; a failure then sends no second summary and waits 7 days', async () => {
+  // crawl_delay 0, so the memos are read at the pass's starting time.
+  const side = rexSpider({ halt: false, crawlDelay: 0 });
+  const core = rexCore();
+  const lists = { main: [listed(1, 1)], details: { [chat(1)]: failing(500) } };
+  await pass(site(lists), side, { core });
+  const memo = core.memos.get(chat(1)) as DetailMemo;
+  assert.equal(memo.retryMs, SOON);
+  const held = await pass(site(lists), side, { core, now: memo.at + memo.retryMs - 1 });
+  assert.deepEqual(detailsOf(held.events), []);
+  assert.equal(withoutMs(held.outcome.reason), 'ok seen=1 dispatched=0 held=1');
+  const again = await pass(site(lists), side, { core, now: memo.at + memo.retryMs });
+  assert.deepEqual(detailsOf(again.events), [chat(1)]);
+  assert.deepEqual(again.sent, []);
+  const repeat = core.memos.get(chat(1)) as DetailMemo;
+  assert.deepEqual([repeat.failures, repeat.retryMs], [2, LATE]);
+});
+
+test('a chat used since its memo was written is read at once, and a read that works clears the memo', async () => {
+  const core = rexCore({ memos: { [chat(1)]: { ended: mainKeyMs(listTime(NOW - 2 * DAY)), at: NOW - 1000, retryMs: LATE, failures: 1 } } });
+  const run = await pass(site({ main: [listed(1, 1)] }), rexSpider({ halt: false }), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(core.memoClears, [chat(1)]);
+  assert.deepEqual(summariesOf(run.sent), [[chat(1), false]]);
+});
+
+test('a memo written under a clock that ran fast is not trusted, and one of the wrong form is cleared by a read that works', async () => {
+  const fast = rexCore({ memos: { [chat(1)]: { ended: mainKeyMs(listTime(NOW - DAY)), at: NOW + 2 * DAY, retryMs: LATE, failures: 1 } } });
+  const run = await pass(site({ main: [listed(1, 1)] }), rexSpider({ halt: false }), { core: fast });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  const odd = rexCore({ memoMalformed: [chat(1)] });
+  await pass(site({ main: [listed(1, 1)] }), rexSpider({ halt: false }), { core: odd });
+  assert.deepEqual(odd.memoClears, [chat(1)]);
+});
+
+test('a memo that gets no answer holds its chat back for the pass, and the next chat is read', async () => {
+  const core = rexCore({ memoUnanswered: [chat(1)] });
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), rexSpider({ halt: false }), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(2)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 held=1');
+});
+
+test('a memo that is not kept stops the sending before the next read, and its chat counts as left: a later pass reads it at once', async () => {
+  const core = rexCore({ memoUnkept: true });
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)], details: { [chat(1)]: failing(500) } }), rexSpider({ halt: false }), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 failed=1 left=2 stop=store');
+});
+
+test('three failed reads in a row end the pass, each with its summary and memo', async () => {
+  const main = [1, 2, 3, 4, 5].map((n) => listed(n, n));
+  const details = Object.fromEntries([1, 2, 3, 4, 5].map((n) => [chat(n), failing(500)]));
+  const core = rexCore();
+  const run = await pass(site({ main, details }), rexSpider({ halt: false }), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2), chat(3)]);
+  assert.deepEqual(core.memoWrites.map(([chatId]) => chatId), [chat(1), chat(2), chat(3)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=5 dispatched=3 failed=3 left=2 stop=failed-reads');
+});
+
+test('a read that works breaks the run, and a chat held back by its memo neither counts in it nor breaks it', async () => {
+  const main = [1, 2, 3, 4, 5, 6, 7].map((n) => listed(n, n));
+  const details = { [chat(1)]: failing(500), [chat(3)]: failing(500), [chat(5)]: failing(404), [chat(6)]: failing(500) };
+  const core = rexCore({ memos: { [chat(4)]: { ended: mainKeyMs(listTime(NOW - 4 * DAY)), at: NOW - 1000, retryMs: LATE, failures: 1 } } });
+  const run = await pass(site({ main, details }), rexSpider({ halt: false }), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2), chat(3), chat(5), chat(6)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=7 dispatched=5 failed=4 held=1 left=1 stop=failed-reads');
+});
+
+test('halt_on_error ends the reads at the first that fails, after its summary and memo', async () => {
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)], details: { [chat(1)]: failing(500) } }), rexSpider(), { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(summariesOf(run.sent), [[chat(1), true]]);
+  assert.deepEqual(core.memoWrites.map(([chatId]) => chatId), [chat(1)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 failed=1 left=1 stop=halt-on-error');
+});
+
+test('halt_on_error is read before each chat: served during the reads, it ends them at the next failure', async () => {
+  const web = site({ main: [1, 2, 3, 4].map((n) => listed(n, n)), details: { [chat(1)]: failing(500), [chat(3)]: failing(500) } });
+  const run = await pass(web, rexSpider({ halt: () => web.reads.length >= 2 }));
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2), chat(3)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=4 dispatched=3 failed=2 left=1 stop=halt-on-error');
+});
+
+test('a back-off that has run out is cleared by a pass that reads a list page with no refusal, and kept by one that reads none', async () => {
+  const old: BackoffState = { until: NOW - 1, failures: 3, code: 'rate-limited' };
+  const cleared = rexCore({ backoff: old });
+  await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { core: cleared });
+  assert.deepEqual(cleared.backoffWrites, [null]);
+  for (const options of [{ home: failing(500) }, { home: failing(401) }] as SiteOptions[]) {
+    const kept = rexCore({ backoff: old });
+    await pass(site(options), rexSpider({ summarize: true }), { core: kept });
+    assert.deepEqual(kept.backoffWrites, []);
+  }
+});
+
+test('a stored back-off more than 6 hours ahead is ignored, and the pass runs', async () => {
+  const core = rexCore({ backoff: { until: NOW + 6 * 60 * MINUTE + 1, failures: 1, code: 'challenge' } });
+  const web = site({ main: [listed(1, 1)] });
+  const run = await pass(web, rexSpider({ summarize: true }), { core });
+  assert.ok(web.requests.length > 0);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+  assert.deepEqual(core.backoffWrites, [null]);
+});
+
+test('a back-off that gets no answer does not stop the pass', async () => {
+  const core = rexCore({ backoffUnanswered: true });
+  const run = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { core });
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+});
+
+test('a switch-off is read before the back-off: a disabled spider reads no store', async () => {
+  const core = rexCore({ backoff: { until: NOW + MINUTE, failures: 1, code: 'rate-limited' } });
+  const run = await pass(site(), rexSpider({ enabled: false }), { core });
   assert.equal(withoutMs(run.outcome.reason), 'disabled stage=start');
 });

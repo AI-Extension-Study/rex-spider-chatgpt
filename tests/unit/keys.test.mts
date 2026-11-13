@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { DateString } from '@bric/rex-types/types';
 
 import { type Answer } from '../../src/client.mts';
-import { MODE_KEY, keyKind, memoKey, uploadKeyId } from '../../src/keys.mts';
+import { BACKOFF_KEY, MODE_KEY, keyKind, memoKey, uploadKeyId } from '../../src/keys.mts';
 import { type ListItem, uploadTime, walkLists } from '../../src/list.mts';
 
 const CHAT = '00000000-0000-4000-8000-000000000001';
@@ -112,8 +112,9 @@ test('a chat both the main list and a project hold keeps the main path key, one 
   assert.equal(summaryKey(item), `rex-spider-chatgpt-conversation-upload-${BOTH_CHAT}-1788875383781`);
 });
 
-test('the mode record and the memos sit under the spider\'s namespace', () => {
+test('the mode record, the back-off and the memos sit under the spider\'s namespace', () => {
   assert.equal(MODE_KEY, 'rex-spider-chatgpt-mode');
+  assert.equal(BACKOFF_KEY, 'rex-spider-chatgpt-backoff');
   assert.equal(memoKey(CHAT), `rex-spider-chatgpt-detail-memo-${CHAT}`);
 });
 
@@ -124,6 +125,7 @@ test('a memo key needs a chat id', () => {
 
 test('what may be logged of a key is its kind, never a chat id', () => {
   assert.equal(keyKind(MODE_KEY), 'rex-spider-chatgpt-mode');
+  assert.equal(keyKind(BACKOFF_KEY), 'rex-spider-chatgpt-backoff');
   assert.equal(keyKind(memoKey(CHAT)), 'rex-spider-chatgpt-detail-memo');
   assert.equal(keyKind(`rex-spider-chatgpt-conversation-upload-${CHAT}-1788875383781`), 'other key');
 });

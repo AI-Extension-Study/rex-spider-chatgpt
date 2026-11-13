@@ -5,17 +5,29 @@
 // and the clock are handed in, so the pass runs under the unit tests as it
 // does in the worker. It never throws: every outcome is a reason
 // (reasons.mts), and it never logs text, an id or the token.
+//
+// The failure policy. A 429, a 503, any Retry-After or a Cloudflare challenge
+// stops the pass and sets a back-off that outlives the worker (backoff.mts),
+// which skips the passes after it until it runs out; that chat gets nothing
+// and is read after it. No token on the home page, or a 401 anywhere, ends
+// the pass as not signed in, with no back-off; the next pass reads the token
+// again. Any other failed read of a chat's detail is that chat's alone: its
+// summary goes out in the detail's place unless one went out at that time,
+// and a memo holds it back for a day, or a week when the answer will not pass
+// by itself. Three such in a row end the pass, or the first with
+// halt_on_error.
 import { type DateString } from '@bric/rex-types/types';
 
+import { type BackoffCode, type BackoffState, backoffDecision, nextBackoff } from './backoff.mts';
 import { type Answer, type Classification, type Client, RequestError, classify, retryAfterMs } from './client.mts';
 import { HOME_URL, accessToken } from './home.mts';
 import { uploadKeyId } from './keys.mts';
 import { type CrawlWindow, type ListItem, type WalkResult, crawlDelayMs, uploadTime, walkLists } from './list.mts';
-import { type Transmitted, dueState, resendSince } from './mode.mts';
+import { CLOCK_SKEW_MS, type Transmitted, dueState, resendSince } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { type ReasonCode, type ReasonFields, type Stop, formatReason } from './reasons.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from './record.mts';
-import { type ChatGPTStore, type Mode } from './store.mts';
+import { type ChatGPTStore, type DetailMemo, type Mode } from './store.mts';
 
 // The rex-spider calls the pass makes on the spider. The flags are the
 // served config as of the last refresh, read where they apply: isEnabled
@@ -56,17 +68,30 @@ export interface PassLimits {
   // A first sweep runs as one pass; the chats it does not reach keep no key
   // and are read in a later pass.
   readonly detailBudgetMs: number;
+  // Failed detail reads in a row that end a pass without halt_on_error: past
+  // a few, the reads are failing for a reason the next chats share.
+  readonly failedRun: number;
 }
 
-export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, hashMs: 1000, detailBudgetMs: 360_000 };
+export const PASS_LIMITS: PassLimits = { settleMs: 3000, batch: 25, storeMs: 20_000, hashMs: 1000, detailBudgetMs: 360_000, failedRun: 3 };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// When a chat whose detail could not be read is read again: a day after a
+// first failure that may pass by itself (no answer, a 5xx, a page that is not
+// JSON), a week after any other or a repeat. A chat used since, with a newer
+// list time, is read at once.
+export const RETRY_SOON_MS = DAY_MS;
+export const RETRY_LATE_MS = 7 * DAY_MS;
 
 export interface PassDeps {
   // A client for chatgpt.com: with no token for the home page, then with the
   // token read from it.
   readonly client: (token?: string) => Pick<Client, 'get'>;
   readonly framework: PassFramework;
-  // rex-core's store, for the mode record (mode.mts).
-  readonly store: Pick<ChatGPTStore, 'mode'>;
+  // rex-core's store, for the mode record (mode.mts), the back-off
+  // (backoff.mts) and the memos of failed detail reads.
+  readonly store: Pick<ChatGPTStore, 'mode' | 'backoff' | 'memo'>;
   readonly dispatch: (record: Record<string, unknown>) => void;
   // Every wait of the pass, in chunks of at most 20 s with a keep-alive call
   // before each (pacing.mts).
@@ -123,6 +148,14 @@ interface Pass {
   waited: number;
   // Where a throw is reported, until the list is read.
   stage: Stage;
+  // The back-off as the pass found it, null when there was none or it could
+  // not be read.
+  backoff: BackoffState | null;
+  // The pass's refusal, which sets the back-off; at most one, since it stops
+  // the pass.
+  refusal: { readonly code: BackoffCode; readonly retryAfterMs: number | null } | null;
+  // List pages answered in full, which with no refusal clear the back-off.
+  pagesRead: number;
 }
 
 const nameOf = (error: unknown) => (error instanceof Error ? error.name : typeof error);
@@ -320,26 +353,73 @@ async function readDetail(pass: Pass, client: Pick<Client, 'get'>, item: ListIte
   return { kind: 'failed', why: verdict, retryAfterMs: verdict === 'rate-limited' || verdict === 'challenge' ? retryAfterMs(answer, pass.now()) : null };
 }
 
-// What ends the reads at a failed one.
-const STOP_OF: Readonly<Partial<Record<string, Stop>>> = { 'rate-limited': 'rate-limited', challenge: 'challenge', 'signed-out': 'not-signed-in' };
+// Whether the answer that failed a read may pass by itself: no answer, a 5xx,
+// or a 2xx page that is not JSON, as an interstitial is. A refusal (a 403, a
+// 404, any other 4xx) and a detail the builder cannot read wait for a change.
+const MAY_PASS: ReadonlySet<string> = new Set(['timeout', 'network', 'server', 'not-json']);
+
+// A write that waits for the wait before the next read, as a record waits to
+// be stored before its key does: a detail record's key, or the memo of a
+// failed read, whose summary may have just gone out.
+type Pending =
+  | { readonly kind: 'stamp'; readonly id: string; readonly at: DateString }
+  | { readonly kind: 'memo'; readonly chatId: string; readonly memo: DetailMemo };
+
+// A memo that is not kept stops the sending, as a stamp does: the next pass
+// would read the chat again at once and send its summary again.
+async function written(pass: Pass, write: Pending): Promise<boolean> {
+  if (write.kind === 'stamp') {
+    return stamp(pass, write.id, write.at);
+  }
+  touch(pass.deps.keepAlive, pass.say);
+  let kept: boolean;
+  try {
+    kept = (await pass.deps.store.memo.set(write.chatId, write.memo)).ok;
+  } catch {
+    kept = false;
+  }
+  if (!kept) {
+    pass.say('a detail memo was not kept; the sending stops for this pass');
+  }
+  return kept;
+}
 
 // Detail mode: each chat read in turn, crawl_delay apart and never closer
 // than the settle wait, until the reads have spent the detail budget. A
-// record's key is stamped after the wait before the next read, or after a
-// settle wait at the end, so the record is stored before its key. A read
-// that fails ends the reads, and its chat is read again in a later pass.
+// record's key, or a failed read's memo, is written after the wait before the
+// next read, or after a settle wait at the end, so what went out is stored
+// before what says it went out. A chat its memo holds back is passed over,
+// and neither counts in a run of failed reads nor breaks one.
 async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonly ListItem[]): Promise<Sending> {
-  const { framework } = pass.deps;
+  const { framework, store } = pass.deps;
   let sent = 0;
-  let stamped = 0;
+  // Chats dealt with for now: a record whose key was kept, or a failed read
+  // whose memo was kept. With the held ones, the rest are left.
+  let done = 0;
   let failed = 0;
-  let index = 0;
+  let held = 0;
+  let inARow = 0;
   let stop: Stop | null = null;
-  let pending: { readonly id: string; readonly at: DateString } | null = null;
+  let pending: Pending | null = null;
   const start = markOf(pass);
   try {
-    for (; index < due.length; index += 1) {
-      const item = due[index];
+    for (const item of due) {
+      const at = uploadTime(item);
+      touch(pass.deps.keepAlive, pass.say);
+      const memo = await store.memo.get(item.id);
+      if (memo.unanswered) {
+        pass.say('a detail memo got no answer; its chat is read in a later pass');
+        held += 1;
+        continue;
+      }
+      // A memo of this list time holds its chat until its retry time, unless
+      // it was written under a clock that ran fast, which the mode record's
+      // start is not trusted after either (mode.mts).
+      const earlier = memo.value !== null && memo.value.ended === at.timestamp() ? memo.value : null;
+      if (earlier !== null && earlier.at <= pass.now() + CLOCK_SKEW_MS && pass.now() < earlier.at + earlier.retryMs) {
+        held += 1;
+        continue;
+      }
       if (spentSince(pass, start) >= pass.limits.detailBudgetMs) {
         pass.say('the detail budget is spent; the chats not read are read in a later pass');
         stop = 'budget';
@@ -347,20 +427,29 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
       }
       await pace(pass, Math.max(crawlDelayMs(framework.fetchCrawlDelay()), pass.limits.settleMs));
       if (pending !== null) {
-        const key = pending;
+        const write = pending;
         pending = null;
-        if (!(await stamp(pass, key.id, key.at))) {
+        if (!(await written(pass, write))) {
           stop = 'store';
           break;
         }
-        stamped += 1;
+        done += 1;
       }
       stop = halted(pass, 'detail');
       if (stop !== null) {
         break;
       }
+      // halt_on_error as served now, for this chat's read.
+      const halts = !framework.continueAfterError();
       const read = await readDetail(pass, client, item);
       if (read.kind === 'record') {
+        inARow = 0;
+        if (memo.value !== null || memo.malformed) {
+          touch(pass.deps.keepAlive, pass.say);
+          if (!(await store.memo.clear(item.id)).ok) {
+            pass.say('a detail memo was not cleared');
+          }
+        }
         if (!dispatched(pass, read.record)) {
           stop = 'internal';
           break;
@@ -369,31 +458,64 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
         // The key's time is the list's, as the key was checked, never the
         // record's ended (its latest message), which would make the key new
         // on every pass.
-        pending = { id: uploadKeyId(item.id, false), at: uploadTime(item) };
+        pending = { kind: 'stamp', id: uploadKeyId(item.id, false), at };
         continue;
       }
+      if (read.why === 'rate-limited' || read.why === 'challenge') {
+        // The site asked for a wait: this chat gets nothing now, and is read
+        // after the back-off.
+        pass.refusal = { code: read.why, retryAfterMs: read.retryAfterMs };
+        pass.say('the site asked for a wait; the chats not read are read after the back-off');
+        stop = read.why;
+        break;
+      }
+      if (read.why === 'signed-out') {
+        pass.say('the session ended during the detail reads; the next pass reads the token again');
+        stop = 'not-signed-in';
+        break;
+      }
       failed += 1;
-      stop = STOP_OF[read.why] ?? 'failed-reads';
-      break;
+      inARow += 1;
+      const failures = (earlier?.failures ?? 0) + 1;
+      // The summary goes out in the detail's place once per list time: at a
+      // first failure, and unless summary mode sent it at that time before a
+      // switch. It gets no key: a chat last used before the re-send window
+      // would then count as sent in detail (mode.mts), and its read would
+      // never come again.
+      if (failures === 1 && !(await lookup(pass)(uploadKeyId(item.id, true), at))) {
+        if (!dispatched(pass, await pass.records.summary(item, pass.hash))) {
+          // No memo, so a later pass reads the chat at once and sends its
+          // summary then.
+          stop = 'internal';
+          break;
+        }
+        sent += 1;
+      }
+      pending = { kind: 'memo', chatId: item.id, memo: { ended: at.timestamp(), at: pass.now(), retryMs: MAY_PASS.has(read.why) && failures === 1 ? RETRY_SOON_MS : RETRY_LATE_MS, failures } };
+      if (halts || inARow >= pass.limits.failedRun) {
+        pass.say(halts ? 'a detail read failed and halt_on_error is set; the reads stop' : `${inARow} detail reads failed in a row; the reads stop`);
+        stop = halts ? 'halt-on-error' : 'failed-reads';
+        break;
+      }
     }
   } catch (error) {
-    pass.say(`the detail reads ended on an internal error (${nameOf(error)})`);
-    stop = 'internal';
+    pass.say(error instanceof StoreSilent ? 'an upload key got no answer; the sending stops for this pass' : `the detail reads ended on an internal error (${nameOf(error)})`);
+    stop = error instanceof StoreSilent ? 'store' : 'internal';
   }
   if (pending !== null) {
     try {
       await pace(pass, pass.limits.settleMs);
-      if (await stamp(pass, pending.id, pending.at)) {
-        stamped += 1;
+      if (await written(pass, pending)) {
+        done += 1;
       } else {
         stop ??= 'store';
       }
     } catch (error) {
-      pass.say(`the last upload key was not written (${nameOf(error)})`);
+      pass.say(`the last write of the detail reads was not made (${nameOf(error)})`);
       stop ??= 'internal';
     }
   }
-  return { sent, failed, held: 0, stop, ...(stop === null ? {} : { left: due.length - stamped }) };
+  return { sent, failed, held, stop, ...(stop === null ? {} : { left: due.length - done - held }) };
 }
 
 // The chats due this pass, checked against the upload keys, then sent in the
@@ -431,8 +553,9 @@ async function sendAll(pass: Pass, client: Pick<Client, 'get'>, walk: WalkResult
   return { ...sending, held: sending.held + held };
 }
 
-// The pass with no reading of the list.
-function none<C extends Exclude<ReasonCode, 'ok' | 'partial'>>(pass: Pass, code: C, fields: Omit<ReasonFields<C>, 'ms'>): PassOutcome {
+// The pass with no reading of the list. A skipped pass, which made no
+// attempt, has no ms and is written where it is skipped.
+function none<C extends Exclude<ReasonCode, 'ok' | 'partial' | 'backoff'>>(pass: Pass, code: C, fields: Omit<ReasonFields<C>, 'ms'>): PassOutcome {
   return { count: -1, ids: [], reason: formatReason(code, { ...fields, ms: elapsed(pass) } as unknown as ReasonFields<C>) };
 }
 
@@ -449,9 +572,13 @@ async function readHome(pass: Pass): Promise<{ readonly token: string } | PassOu
   const verdict = classify(home);
   switch (verdict) {
     case 'rate-limited':
-      return none(pass, 'rate-limited', { stage: 'home', status: home.status, 'retry-after': seconds(retryAfterMs(home, pass.now())) });
-    case 'challenge':
-      return none(pass, 'challenge', { stage: 'home', status: home.status });
+    case 'challenge': {
+      const asked = retryAfterMs(home, pass.now());
+      pass.refusal = { code: verdict, retryAfterMs: asked };
+      return verdict === 'challenge'
+        ? none(pass, 'challenge', { stage: 'home', status: home.status })
+        : none(pass, 'rate-limited', { stage: 'home', status: home.status, 'retry-after': seconds(asked) });
+    }
     case 'signed-out':
       return none(pass, 'not-signed-in', { stage: 'home', status: home.status });
     case 'refused':
@@ -473,8 +600,10 @@ async function readHome(pass: Pass): Promise<{ readonly token: string } | PassOu
 function walkFailed(pass: Pass, walk: WalkResult): PassOutcome {
   switch (walk.reason) {
     case 'rate-limited':
+      pass.refusal = { code: 'rate-limited', retryAfterMs: walk.retryAfterMs ?? null };
       return none(pass, 'rate-limited', { stage: 'list', 'retry-after': seconds(walk.retryAfterMs) });
     case 'challenge':
+      pass.refusal = { code: 'challenge', retryAfterMs: walk.retryAfterMs ?? null };
       return none(pass, 'challenge', { stage: 'list' });
     case 'signed-out':
       return none(pass, 'not-signed-in', { stage: 'list', status: 401 });
@@ -501,6 +630,19 @@ async function run(pass: Pass): Promise<PassOutcome> {
   // switched the spider off since.
   if (!framework.isEnabled()) {
     return none(pass, 'disabled', { stage: 'start' });
+  }
+  // A back-off still running skips the pass with no request. One that cannot
+  // be read is no reason to skip.
+  touch(deps.keepAlive, pass.say);
+  const stored = await deps.store.backoff.get();
+  if (stored.unanswered) {
+    pass.say('the back-off got no answer; the pass goes ahead');
+  }
+  pass.backoff = stored.value;
+  const decision = backoffDecision(stored.value, pass.now());
+  if (decision.skip) {
+    pass.say('a back-off is running; the pass is skipped');
+    return { count: -1, ids: [], reason: formatReason('backoff', { until: decision.until, code: decision.code }) };
   }
   const served: Mode = framework.justSummarize() ? 'summary' : 'detail';
   // When this browser started running the served mode, written now if it
@@ -547,7 +689,17 @@ async function run(pass: Pass): Promise<PassOutcome> {
   try {
     // enabled is read again after each of the walk's waits, so a spider
     // switched off during the walk sends no request after it.
-    walk = await walkLists(client, window, {
+    // A list page answered in full counts toward clearing the back-off.
+    const counted: Pick<Client, 'get'> = {
+      get: async (url) => {
+        const answer = await client.get(url);
+        if (classify(answer) === 'ok') {
+          pass.pagesRead += 1;
+        }
+        return answer;
+      },
+    };
+    walk = await walkLists(counted, window, {
       crawlDelay: () => framework.fetchCrawlDelay(),
       sleep: async (ms) => {
         await pace(pass, ms);
@@ -589,6 +741,31 @@ async function run(pass: Pass): Promise<PassOutcome> {
   };
 }
 
+// What outlives the pass. A refusal sets the back-off, longer after each in a
+// row; a pass that read a list page and met none clears it; a pass that read
+// none says nothing of the site, and the back-off stays as it was. Never
+// throws: the outcome is the pass's report, and a store that fails here must
+// not lose it.
+async function persist(pass: Pass): Promise<void> {
+  const { refusal } = pass;
+  let next: BackoffState | null;
+  if (refusal !== null) {
+    next = nextBackoff(pass.backoff, { kind: 'refused', now: pass.now(), code: refusal.code, retryAfterMs: refusal.retryAfterMs });
+  } else if (pass.pagesRead > 0 && pass.backoff !== null) {
+    next = null;
+  } else {
+    return;
+  }
+  try {
+    touch(pass.deps.keepAlive, pass.say);
+    if (!(await pass.deps.store.backoff.set(next)).ok) {
+      pass.say('the back-off was not stored');
+    }
+  } catch (error) {
+    pass.say(`the back-off was not stored (${nameOf(error)})`);
+  }
+}
+
 export async function runPass(deps: PassDeps, now: () => number): Promise<PassOutcome> {
   const log = deps.log ?? ((line: string) => console.log(`[rex-spider-chatgpt] ${line}`));
   // A log that throws has nowhere left to report to.
@@ -602,8 +779,19 @@ export async function runPass(deps: PassDeps, now: () => number): Promise<PassOu
   let pass: Pass | null = null;
   try {
     const limits = deps.limits ?? PASS_LIMITS;
-    pass = { deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), records: deps.records ?? RECORDS, started: now(), waited: 0, stage: 'start' };
-    return await run(pass);
+    pass = {
+      deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), records: deps.records ?? RECORDS, started: now(), waited: 0, stage: 'start',
+      backoff: null, refusal: null, pagesRead: 0,
+    };
+    let outcome: PassOutcome;
+    try {
+      outcome = await run(pass);
+    } catch (error) {
+      say(`the pass ended on an internal error (${nameOf(error)})`);
+      outcome = none(pass, 'internal', { stage: pass.stage });
+    }
+    await persist(pass);
+    return outcome;
   } catch (error) {
     say(`the pass ended on an internal error (${nameOf(error)})`);
     try {
