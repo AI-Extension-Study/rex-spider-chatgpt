@@ -268,8 +268,9 @@ interface RunOptions {
   // How long one detail read takes on the clock, and one home or list request.
   readonly readMs?: number;
   readonly listMs?: number;
-  // How long a stamp takes on the clock.
+  // How long a stamp, or a memo read, takes on the clock.
   readonly stampMs?: number;
+  readonly memoMs?: number;
   // How long a wait takes on the clock: what it asked for unless a test says.
   readonly slept?: (ms: number) => number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -335,6 +336,7 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
       memo: {
         get: (chatId) => {
           trace.push(`memo get ${chatId}`);
+          clock += options.memoMs ?? 0;
           return core.store.memo.get(chatId);
         },
         set: (chatId, memo) => {
@@ -442,7 +444,7 @@ test('the detail pass reads each chat and sends format 1 records, stamped with -
 });
 
 // The calls that go to rex-core: the store adapter's and rex-spider's.
-const REX_CORE_CALL = /^(window|lookup |stamp |mode (get|set))/;
+const REX_CORE_CALL = /^(window|lookup |stamp |mode (get|set)|memo |clear |backoff (get|set))/;
 
 test('every call to rex-core is made just after a keep-alive call, since store calls do not reset the worker\'s idle timer', async () => {
   const side = rexSpider({ keys: [keyOf(2, 2, 'detail')] });
@@ -1064,4 +1066,38 @@ test('a switch-off is read before the back-off: a disabled spider reads no store
   const core = rexCore({ backoff: { until: NOW + MINUTE, failures: 1, code: 'rate-limited' } });
   const run = await pass(site(), rexSpider({ enabled: false }), { core });
   assert.equal(withoutMs(run.outcome.reason), 'disabled stage=start');
+});
+
+test('every memo and back-off call is made just after a keep-alive call too', async () => {
+  const core = rexCore({
+    backoff: { until: NOW - 1, failures: 2, code: 'rate-limited' },
+    memos: {
+      // Chat 2's memo is of an older list time, so it is read and its memo cleared; chat 3's holds it back.
+      [chat(2)]: { ended: mainKeyMs(listTime(NOW - 9 * DAY)), at: NOW - 1000, retryMs: LATE, failures: 1 },
+      [chat(3)]: { ended: mainKeyMs(listTime(NOW - 3 * DAY)), at: NOW - 1000, retryMs: LATE, failures: 1 },
+    },
+  });
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2), listed(3, 3)], details: { [chat(1)]: failing(500) } }), rexSpider({ halt: false }), { core });
+  for (const kind of ['backoff get', 'memo get', `memo ${chat(1)}`, `clear ${chat(2)}`, 'backoff set']) {
+    assert.ok(run.trace.some((entry) => entry.startsWith(kind)), `no ${kind} call`);
+  }
+  const calls = run.trace.flatMap((entry, at) => (REX_CORE_CALL.test(entry) ? [[entry, run.trace[at - 1]]] : []));
+  for (const [call, before] of calls) {
+    assert.equal(before, 'keep-alive', `${call} came after ${before}`);
+  }
+});
+
+test('memo reads during the reads count against the budget: at 100 s a memo read, the reads stop after three', async () => {
+  const main = [1, 2, 3, 4, 5, 6].map((n) => listed(n, n));
+  const run = await pass(site({ main }), rexSpider({ halt: false }), { memoMs: 100_000 });
+  assert.deepEqual(detailsOf(run.events), [1, 2, 3].map(chat));
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=6 dispatched=3 left=3 stop=budget');
+});
+
+test('a back-off is not cleared by a pass whose list pages all failed without a refusal, a 500 on each', async () => {
+  const broken = failing(500);
+  const core = rexCore({ backoff: { until: NOW - 1, failures: 2, code: 'rate-limited' } });
+  const run = await pass(site({ main: [listed(1, 1)], failing: { main: broken, archived: broken, starred: broken, sidebar: broken } }), rexSpider({ summarize: true }), { core });
+  assert.equal(withoutMs(run.outcome.reason), 'list-failed');
+  assert.deepEqual(core.backoffWrites, []);
 });
