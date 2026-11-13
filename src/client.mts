@@ -118,7 +118,10 @@ function isJson(text: string): boolean {
 // status. A wait (429, 503, any Retry-After) is read before a refusal, since
 // a 403 that names a wait is a wait. Any other 4xx is a refusal; anything
 // else that is not a 2xx (a 5xx, or a redirect that was not followed) is the
-// server's. A 2xx whose body is not JSON is a login or challenge page.
+// server's. A 2xx whose body is not JSON is not-json: a page where JSON was
+// expected, such as an interstitial. It says nothing of the session (a
+// signed-out session gets a 401), so the walk ends that list only, and the
+// pass counts it against the one chat whose detail it was.
 export function classify(answer: Answer): Classification {
   const { status } = answer;
   if (header(answer, 'cf-mitigated') !== undefined) {

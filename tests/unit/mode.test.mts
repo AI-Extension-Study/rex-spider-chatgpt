@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import { DateString } from '@bric/rex-types/types';
 
-import { CLOCK_SKEW_MS, RESEND_WINDOW_MS, resendSince, sentAlready } from '../../src/mode.mts';
+import { CLOCK_SKEW_MS, RESEND_WINDOW_MS, dueState, resendSince, sentAlready } from '../../src/mode.mts';
 import { type HandleMessage, type ModeRecord, type Read, type Write, createStore } from '../../src/store.mts';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -183,4 +183,17 @@ test('the update itself: a browser with only summary keys, served detail, re-sen
     if (!(await sentAlready(held, id, at(ended), 'detail', since))) resent.push(id);
   }
   assert.deepEqual(resent, ['c_nov18', 'c_sep1']);
+});
+
+test('what a chat needs this pass, three ways: sent, due, or held back for want of a start', async () => {
+  const ended = SWITCH - 3 * DAY;
+  const old = SWITCH - 100 * DAY;
+  assert.equal(await dueState(keys(['c_1-detail', ended]), 'c_1', at(ended), 'detail', SWITCH), 'sent');
+  assert.equal(await dueState(keys(), 'c_1', at(ended), 'detail', SWITCH), 'due');
+  assert.equal(await dueState(keys(['c_1', ended]), 'c_1', at(ended), 'detail', SWITCH), 'due');
+  assert.equal(await dueState(keys(['c_1', old]), 'c_1', at(old), 'detail', SWITCH), 'sent');
+  assert.equal(await dueState(keys(['c_1', ended]), 'c_1', at(ended), 'detail', null), 'held');
+  assert.equal(await dueState(keys(['c_1', old]), 'c_1', at(old), 'detail', null), 'held');
+  assert.equal(await dueState(keys(), 'c_1', at(ended), 'detail', null), 'due');
+  assert.equal(await dueState(keys(['c_1-detail', ended]), 'c_1', at(ended), 'detail', null), 'sent');
 });

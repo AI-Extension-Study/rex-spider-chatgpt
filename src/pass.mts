@@ -11,7 +11,7 @@ import { type Answer, type Classification, type Client, RequestError, classify, 
 import { HOME_URL, accessToken } from './home.mts';
 import { uploadKeyId } from './keys.mts';
 import { type CrawlWindow, type ListItem, type WalkResult, crawlDelayMs, uploadTime, walkLists } from './list.mts';
-import { type Transmitted, resendSince, sentAlready } from './mode.mts';
+import { type Transmitted, dueState, resendSince } from './mode.mts';
 import { TIMED_OUT, touch, withDeadline } from './pacing.mts';
 import { type ReasonCode, type ReasonFields, type Stop, formatReason } from './reasons.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from './record.mts';
@@ -48,11 +48,13 @@ export interface PassLimits {
   // The longest wait for one hash. rex-core's sha256 never settles when the
   // digest fails, and a record must not wait on it for good.
   readonly hashMs: number;
-  // The reading time after which a pass reads no more details: its requests,
-  // parsing and store calls since it started, and not its paced waits, which
-  // at the 30 s pace would end a pass after a dozen reads. A first sweep then
-  // runs as one pass; the chats it does not reach keep no key and are read in
-  // a later pass.
+  // The reading time after which a pass reads no more details: the requests,
+  // parsing and store calls of its detail reads, and not its paced waits,
+  // which at the 30 s pace would end a pass after a dozen reads. It starts at
+  // the first detail read, since every pass walks the whole list first, and a
+  // heavy account's walk could otherwise spend it before any detail is read.
+  // A first sweep runs as one pass; the chats it does not reach keep no key
+  // and are read in a later pass.
   readonly detailBudgetMs: number;
 }
 
@@ -72,16 +74,28 @@ export interface PassDeps {
   // Made before each store call, which does not reset the worker's idle timer.
   readonly keepAlive: () => unknown;
   readonly hash: Hash;
+  // The record builders (record.mts): the real ones unless a test hands in
+  // others.
+  readonly records?: Records;
   readonly limits?: PassLimits;
   readonly log?: (line: string) => void;
 }
 
+export interface Records {
+  readonly summary: typeof buildSummaryRecord;
+  readonly detail: typeof buildDetailRecord;
+}
+
+const RECORDS: Records = { summary: buildSummaryRecord, detail: buildDetailRecord };
+
 export interface PassOutcome {
-  // Records sent, or -1 when the pass has no reading of the list. Readers of
-  // the completion event take 0 or more to mean ids is such a reading, so an
-  // empty list there would read as an emptied account.
+  // Records sent when the pass read the whole list, or -1 when it has no
+  // whole reading of it: it read none, or only part. Readers of the completion
+  // event take 0 or more to mean ids is the account's chats in the window, so
+  // a list read in part would read as chats deleted. The reason still says
+  // how many records a partial pass sent.
   readonly count: number;
-  // The chats listed in the crawl window, in the walk's order.
+  // The chats listed in the crawl window, in the walk's order; [] with -1.
   readonly ids: string[];
   readonly reason: string;
 }
@@ -102,6 +116,8 @@ interface Pass {
   readonly now: () => number;
   readonly say: (line: string) => void;
   readonly hash: Hash;
+  readonly records: Records;
+  // When the pass started, for the ms its reason ends with.
   readonly started: number;
   // Time spent in the paced waits, which the detail budget leaves out.
   waited: number;
@@ -120,7 +136,14 @@ async function pace(pass: Pass, ms: number): Promise<void> {
   pass.waited += Math.max(0, pass.now() - from);
 }
 
-const spent = (pass: Pass): number => pass.now() - pass.started - pass.waited;
+// The reading time since a mark: the time since, less the paced waits since.
+interface Mark {
+  readonly at: number;
+  readonly waited: number;
+}
+
+const markOf = (pass: Pass): Mark => ({ at: pass.now(), waited: pass.waited });
+const spentSince = (pass: Pass, mark: Mark): number => pass.now() - mark.at - (pass.waited - mark.waited);
 
 // The pass's wall-clock time, for its reason.
 function elapsed(pass: Pass): number {
@@ -210,8 +233,9 @@ interface Sending {
   readonly failed: number;
   readonly held: number;
   readonly stop: Stop | null;
-  // The due chats the sending did not reach, when it stopped; absent when it
-  // stopped before it knew which chats were due.
+  // When it stopped, the due chats a later pass sends: those not reached, and
+  // those sent without their key, which go out again. Absent when it stopped
+  // before it knew which chats were due.
   readonly left?: number;
 }
 
@@ -220,6 +244,7 @@ interface Sending {
 // so each record is awaited before it is dispatched.
 async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Sending> {
   let sent = 0;
+  let stamped = 0;
   let stop: Stop | null = null;
   try {
     for (let start = 0; start < due.length && stop === null; start += pass.limits.batch) {
@@ -229,7 +254,10 @@ async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Send
         if (stop !== null) {
           break;
         }
-        if (!dispatched(pass, await buildSummaryRecord(item, pass.hash))) {
+        // A hash that hangs holds a record for the hash deadline, and a batch
+        // of them would outlast the worker's idle limit with no call between.
+        touch(pass.deps.keepAlive, pass.say);
+        if (!dispatched(pass, await pass.records.summary(item, pass.hash))) {
           stop = 'internal';
           break;
         }
@@ -243,6 +271,7 @@ async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Send
             stop = 'store';
             break;
           }
+          stamped += 1;
         }
       }
     }
@@ -250,7 +279,7 @@ async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Send
     pass.say(`the summary records ended on an internal error (${nameOf(error)})`);
     stop = 'internal';
   }
-  return { sent, failed: 0, held: 0, stop, ...(stop === null ? {} : { left: due.length - sent }) };
+  return { sent, failed: 0, held: 0, stop, ...(stop === null ? {} : { left: due.length - stamped }) };
 }
 
 type DetailRead =
@@ -270,8 +299,17 @@ async function readDetail(pass: Pass, client: Pick<Client, 'get'>, item: ListIte
   }
   const verdict = classify(answer);
   if (verdict === 'ok') {
-    // classify has parsed the body as JSON, so this cannot throw.
-    const record = await buildDetailRecord(JSON.parse(answer.text), item, pass.hash);
+    // classify has parsed the body as JSON, so the parse cannot throw. A
+    // builder that throws on this detail fails this chat's read alone: were it
+    // to end the pass, the chat would come first on every pass and the chats
+    // behind it would never be read.
+    let record: Record<string, unknown> | null;
+    try {
+      record = await pass.records.detail(JSON.parse(answer.text), item, pass.hash);
+    } catch (error) {
+      pass.say(`the record builder failed on a detail (${nameOf(error)})`);
+      record = null;
+    }
     if (record !== null) {
       return { kind: 'record', record };
     }
@@ -293,14 +331,16 @@ const STOP_OF: Readonly<Partial<Record<string, Stop>>> = { 'rate-limited': 'rate
 async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonly ListItem[]): Promise<Sending> {
   const { framework } = pass.deps;
   let sent = 0;
+  let stamped = 0;
   let failed = 0;
   let index = 0;
   let stop: Stop | null = null;
   let pending: { readonly id: string; readonly at: DateString } | null = null;
+  const start = markOf(pass);
   try {
     for (; index < due.length; index += 1) {
       const item = due[index];
-      if (spent(pass) >= pass.limits.detailBudgetMs) {
+      if (spentSince(pass, start) >= pass.limits.detailBudgetMs) {
         pass.say('the detail budget is spent; the chats not read are read in a later pass');
         stop = 'budget';
         break;
@@ -313,6 +353,7 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
           stop = 'store';
           break;
         }
+        stamped += 1;
       }
       stop = halted(pass, 'detail');
       if (stop !== null) {
@@ -342,15 +383,17 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
   if (pending !== null) {
     try {
       await pace(pass, pass.limits.settleMs);
-      if (!(await stamp(pass, pending.id, pending.at)) && stop === null) {
-        stop = 'store';
+      if (await stamp(pass, pending.id, pending.at)) {
+        stamped += 1;
+      } else {
+        stop ??= 'store';
       }
     } catch (error) {
       pass.say(`the last upload key was not written (${nameOf(error)})`);
       stop ??= 'internal';
     }
   }
-  return { sent, failed, held: 0, stop, ...(stop === null ? {} : { left: due.length - index }) };
+  return { sent, failed, held: 0, stop, ...(stop === null ? {} : { left: due.length - stamped }) };
 }
 
 // The chats due this pass, checked against the upload keys, then sent in the
@@ -369,8 +412,11 @@ async function sendAll(pass: Pass, client: Pick<Client, 'get'>, walk: WalkResult
         continue;
       }
       // The time is the one the key is built from on the item's list path.
-      if (!(await sentAlready(transmitted, item.id, uploadTime(item), served, since))) {
+      const need = await dueState(transmitted, item.id, uploadTime(item), served, since);
+      if (need === 'due') {
         due.push(item);
+      } else if (need === 'held') {
+        held += 1;
       }
     }
   } catch (error) {
@@ -378,7 +424,7 @@ async function sendAll(pass: Pass, client: Pick<Client, 'get'>, walk: WalkResult
     return { sent: 0, failed: 0, held, stop: error instanceof StoreSilent ? 'store' : 'internal' };
   }
   if (held > 0) {
-    pass.say(`${held} archived or starred chats are held back: the project lists were not read whole`);
+    pass.say(`${held} chats are held back for a later pass: archived or starred while the project lists were not read whole, or sent only in the other mode while the mode record could not be read`);
   }
   due.sort((a, b) => uploadTime(b).timestamp() - uploadTime(a).timestamp());
   const sending = served === 'summary' ? await sendSummaries(pass, due) : await sendDetails(pass, client, due);
@@ -475,14 +521,15 @@ async function run(pass: Pass): Promise<PassOutcome> {
   if (since === null) {
     pass.say('the mode record was not read or not written; chats sent only in the other mode wait for a later pass');
   }
-  // The mode record's read and write can each take up to the store's
-  // deadline, and a refresh in that time may have switched the spider off.
-  if (!framework.isEnabled()) {
-    return none(pass, 'disabled', { stage: 'start' });
-  }
   const window = await crawlWindow(pass);
   if (window === null) {
     return none(pass, 'store', {});
+  }
+  // The mode record's read and write and the window's lookup can each take up
+  // to a store deadline, and a refresh in that time may have switched the
+  // spider off, so enabled is read again just before the first request.
+  if (!framework.isEnabled()) {
+    return none(pass, 'disabled', { stage: 'start' });
   }
   pass.stage = 'home';
   const home = await readHome(pass);
@@ -525,13 +572,14 @@ async function run(pass: Pass): Promise<PassOutcome> {
   }
   const sending = await sendAll(pass, client, walk, served, since);
   const ids = walk.items.map((item) => item.id);
+  const whole = walk.outcome === 'whole';
   const positive = (count: number) => (count > 0 ? count : undefined);
   return {
-    count: sending.sent,
-    ids,
-    reason: formatReason(walk.outcome === 'whole' ? 'ok' : 'partial', {
-      listed: ids.length,
-      sent: sending.sent,
+    count: whole ? sending.sent : -1,
+    ids: whole ? ids : [],
+    reason: formatReason(whole ? 'ok' : 'partial', {
+      seen: ids.length,
+      dispatched: sending.sent,
       failed: positive(sending.failed),
       held: positive(sending.held),
       left: sending.left,
@@ -554,7 +602,7 @@ export async function runPass(deps: PassDeps, now: () => number): Promise<PassOu
   let pass: Pass | null = null;
   try {
     const limits = deps.limits ?? PASS_LIMITS;
-    pass = { deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), started: now(), waited: 0, stage: 'start' };
+    pass = { deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), records: deps.records ?? RECORDS, started: now(), waited: 0, stage: 'start' };
     return await run(pass);
   } catch (error) {
     say(`the pass ended on an internal error (${nameOf(error)})`);

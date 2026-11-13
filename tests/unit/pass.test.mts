@@ -6,7 +6,7 @@ import { DateString } from '@bric/rex-types/types';
 
 import { type Answer, RequestError } from '../../src/client.mts';
 import { PASS_LIMITS, type PassFramework, type PassLimits, type PassOutcome, runPass } from '../../src/pass.mts';
-import { type Hash } from '../../src/record.mts';
+import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
 import { type ModeRecord, type Read, type Write } from '../../src/store.mts';
 import { MARK, ROOT, T0, answer, detail, listItem, nodeId, projectItem, prompt, tree } from './fixtures.mts';
 
@@ -69,6 +69,8 @@ interface SiteOptions {
   readonly failing?: Partial<Record<ListName, Answer>>;
   // A chat's detail answer, or one per read of it (1 for the first).
   readonly details?: Readonly<Record<string, Reply>>;
+  // One request's answer by its label ('main 28', 'sidebar'), before any other.
+  readonly answers?: Readonly<Record<string, Answer>>;
 }
 
 // chatgpt.com as the pass reads it: the home page, the three conversation
@@ -79,6 +81,8 @@ function site(options: SiteOptions = {}) {
   const reads: string[] = [];
   const homes = { count: 0 };
   const answerTo = (url: string): Answer => {
+    const given = options.answers?.[label(url)];
+    if (given !== undefined) return given;
     if (url === HOME) {
       homes.count += 1;
       const given = options.home ?? homePage();
@@ -144,6 +148,8 @@ interface SideOptions {
   // failed write.
   readonly unkeptStamps?: boolean;
   readonly silentWindow?: boolean;
+  // Called when the crawl window is looked up.
+  readonly onWindow?: () => void;
 }
 
 // rex-spider's side as the pass sees it: the served flags, the crawl window,
@@ -159,7 +165,10 @@ function rexSpider(options: SideOptions = {}) {
     justSummarize: () => the(options.summarize, false),
     continueAfterError: () => !the(options.halt, true),
     fetchCrawlDelay: () => (options.crawlDelay === undefined ? 30_000 : options.crawlDelay) as number,
-    crawlWindowStart: () => (options.silentWindow === true ? new Promise(() => {}) : Promise.resolve(options.windowStart ?? null)),
+    crawlWindowStart: () => {
+      options.onWindow?.();
+      return options.silentWindow === true ? new Promise(() => {}) : Promise.resolve(options.windowStart ?? null);
+    },
     crawlWindowEnd: async () => null,
     checkIfAlreadyTransmitted: (id, at) => {
       lookups.push(keyOfCall(id, at));
@@ -203,13 +212,18 @@ interface RunOptions {
   readonly core?: ReturnType<typeof rexCore>;
   readonly now?: number;
   readonly limits?: Partial<PassLimits>;
-  // How long one detail read takes on the clock.
+  // How long one detail read takes on the clock, and one home or list request.
   readonly readMs?: number;
+  readonly listMs?: number;
+  // How long a stamp takes on the clock.
+  readonly stampMs?: number;
   // How long a wait takes on the clock: what it asked for unless a test says.
   readonly slept?: (ms: number) => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly hash?: Hash;
   readonly dispatchThrowsOn?: string;
+  // A detail builder in place of the real one.
+  readonly detailBuilder?: typeof buildDetailRecord;
 }
 
 // One pass with the fakes. The clock starts at now and moves only with the
@@ -222,45 +236,75 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
   const sent: Json[] = [];
   const raw: unknown[] = [];
   const events: string[] = [];
+  // events, with every keep-alive call and every rex-core call in its place.
+  const trace: string[] = [];
+  const note = (event: string) => {
+    events.push(event);
+    trace.push(event);
+  };
   const lines: string[] = [];
   const outcome: PassOutcome = await runPass({
     client: (token) => ({
       get: async (url: string) => {
         web.requests.push({ url, token });
-        events.push(`GET ${label(url)}`);
-        if (url.includes('/backend-api/conversation/')) clock += options.readMs ?? 0;
+        note(`GET ${label(url)}`);
+        clock += url.includes('/backend-api/conversation/') ? options.readMs ?? 0 : options.listMs ?? 0;
         return web.answerTo(url);
       },
     }),
     framework: {
       ...side.framework,
+      crawlWindowStart: () => {
+        trace.push('window');
+        return side.framework.crawlWindowStart();
+      },
+      checkIfAlreadyTransmitted: (id, at) => {
+        trace.push(`lookup ${id}`);
+        return side.framework.checkIfAlreadyTransmitted(id, at);
+      },
       logTransmitted: (id, at) => {
-        events.push(`stamp ${id}`);
+        note(`stamp ${id}`);
+        clock += options.stampMs ?? 0;
         return side.framework.logTransmitted(id, at);
       },
     },
-    store: core.store,
+    store: {
+      ...core.store,
+      mode: {
+        get: () => {
+          trace.push('mode get');
+          return core.store.mode.get();
+        },
+        set: (record) => {
+          trace.push('mode set');
+          return core.store.mode.set(record);
+        },
+      },
+    },
     dispatch: (record) => {
       if (record.identifier === options.dispatchThrowsOn) throw new Error('the queue is full');
       raw.push(record);
       const text = JSON.stringify(record);
       assert.equal(text.includes(MARK), false, 'text from the site reached an upload');
       sent.push(JSON.parse(text) as Json);
-      events.push(`dispatch ${String(record.identifier)}`);
+      note(`dispatch ${String(record.identifier)}`);
     },
     sleep: options.sleep ?? (async (ms) => {
-      events.push(`wait ${ms}`);
+      note(`wait ${ms}`);
       clock += (options.slept ?? ((asked) => asked))(ms);
     }),
-    keepAlive: () => {},
+    keepAlive: () => {
+      trace.push('keep-alive');
+    },
     hash: options.hash ?? sha256,
+    ...(options.detailBuilder === undefined ? {} : { records: { summary: buildSummaryRecord, detail: options.detailBuilder } }),
     limits: { ...PASS_LIMITS, storeMs: 50, hashMs: 50, ...options.limits },
     log: (line) => lines.push(line),
   }, () => clock);
   for (const line of lines) {
     assert.equal(line.includes(MARK) || line.includes(TOKEN) || line.includes('g-p-') || /[0-9a-f]{8}-[0-9a-f]{4}-/.test(line), false, `a log line carries text, a token or an id: ${line}`);
   }
-  return { outcome, sent, raw, events, lines, clock: () => clock };
+  return { outcome, sent, raw, events, trace, lines, clock: () => clock };
 }
 
 const withoutMs = (reason: string): string => reason.replace(/ ms=\d+$/, '');
@@ -282,10 +326,10 @@ test('the summary pass sends one summary per listed chat, newest first, stamped 
   }
   assert.deepEqual(run.outcome.ids, [chat(1), chat(2), chat(3)]);
   assert.equal(run.outcome.count, 3);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=3 sent=3');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=3');
   const again = await pass(site({ main: [listed(1, 1), listed(2, 3)], projects: { [PROJECT]: [projectItem(chat(3), { update_time: projectTime })] } }), side);
   assert.deepEqual(again.sent, []);
-  assert.equal(withoutMs(again.outcome.reason), 'ok listed=3 sent=0');
+  assert.equal(withoutMs(again.outcome.reason), 'ok seen=3 dispatched=0');
 });
 
 test('summary records are built in full, their hashes made, before they are dispatched', async () => {
@@ -315,10 +359,32 @@ test('the detail pass reads each chat and sends format 1 records, stamped with -
     assert.equal(record.ended, '2026-11-10T14:00:07Z');
   }
   assert.deepEqual(core.writes, [{ mode: 'detail', since: NOW }]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=3 sent=3');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=3');
   const again = await pass(site(lists), side, { core });
   assert.deepEqual(detailsOf(again.events), []);
-  assert.equal(withoutMs(again.outcome.reason), 'ok listed=3 sent=0');
+  assert.equal(withoutMs(again.outcome.reason), 'ok seen=3 dispatched=0');
+});
+
+// The calls that go to rex-core: the store adapter's and rex-spider's.
+const REX_CORE_CALL = /^(window|lookup |stamp |mode (get|set))/;
+
+test('every call to rex-core is made just after a keep-alive call, since store calls do not reset the worker\'s idle timer', async () => {
+  const side = rexSpider({ keys: [keyOf(2, 2, 'detail')] });
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), side, { core: rexCore({ mode: { mode: 'summary', since: NOW - DAY } }) });
+  const calls = run.trace.flatMap((entry, at) => (REX_CORE_CALL.test(entry) ? [[entry, run.trace[at - 1]]] : []));
+  assert.ok(calls.length >= 8, `only ${calls.length} rex-core calls were seen`);
+  for (const [call, before] of calls) {
+    assert.equal(before, 'keep-alive', `${call} came after ${before}`);
+  }
+});
+
+test('a keep-alive call comes before each summary record is built, since a hash that hangs can hold a record for its deadline', async () => {
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2), listed(3, 3)] }), rexSpider({ summarize: true }));
+  const firstDispatch = run.trace.indexOf(`dispatch ${chat(1)}`);
+  const lastLookup = run.trace.slice(0, firstDispatch).map((entry) => entry.startsWith('lookup ')).lastIndexOf(true);
+  assert.deepEqual(run.trace.slice(lastLookup + 1, run.trace.indexOf('wait 3000')), [
+    'keep-alive', `dispatch ${chat(1)}`, 'keep-alive', `dispatch ${chat(2)}`, 'keep-alive', `dispatch ${chat(3)}`,
+  ]);
 });
 
 test('the home page is fetched with no token, every request after it with the token from it, and a chat\'s detail at its own URL', async () => {
@@ -337,7 +403,7 @@ test('a switch from summary to detail re-sends in detail only the chats last use
   assert.deepEqual(detailsOf(run.events), [chat(3), chat(1)]);
   assert.deepEqual(side.stamps, [keyOf(3, 5, 'detail'), keyOf(1, 10, 'detail')]);
   assert.deepEqual(core.writes, [{ mode: 'detail', since: NOW }]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=3 sent=2');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=2');
 });
 
 test('a switch from detail to summary re-sends as summaries only the chats last used in the 90 days before it', async () => {
@@ -356,6 +422,7 @@ test('a store that does not answer the mode record holds back the chats sent onl
   assert.deepEqual(detailsOf(run.events), [chat(3)]);
   assert.deepEqual(side.stamps, [keyOf(3, 5, 'detail')]);
   assert.deepEqual(core.writes, []);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 held=1');
 });
 
 test('a mode record that cannot be written holds them back too', async () => {
@@ -363,6 +430,7 @@ test('a mode record that cannot be written holds them back too', async () => {
   const core = rexCore({ mode: { mode: 'summary', since: NOW - 200 * DAY }, unkept: true });
   const run = await pass(site({ main: [listed(3, 5), listed(1, 10)] }), side, { core });
   assert.deepEqual(detailsOf(run.events), [chat(3)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 held=1');
 });
 
 test('a key lookup that never answers stops the sending with nothing sent: its deadline rejects, and never reads as not sent', { timeout: 5000 }, async () => {
@@ -372,22 +440,28 @@ test('a key lookup that never answers stops the sending with nothing sent: its d
   assert.deepEqual(detailsOf(run.events), []);
   assert.equal(side.lookups.length, 1);
   assert.equal(run.outcome.count, 0);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=2 sent=0 stop=store');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=0 stop=store');
 });
 
-test('a summary stamp that is not kept stops the sending for the pass', async () => {
+test('a summary stamp that is not kept stops the sending for the pass, and the records with no key count as left: they go out again', async () => {
   const side = rexSpider({ summarize: true, unkeptStamps: true });
   const run = await pass(site({ main: [listed(1, 1), listed(2, 3)] }), side);
   assert.equal(run.sent.length, 2);
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'summary')]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=2 sent=2 left=0 stop=store');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=2 left=2 stop=store');
 });
 
-test('a detail stamp that is not kept stops the reads before the next one', async () => {
+test('a detail stamp that is not kept stops the reads before the next one, and its chat counts as left with the one not read', async () => {
   const side = rexSpider({ unkeptStamps: true });
   const run = await pass(site({ main: [listed(1, 1), listed(2, 3)] }), side);
   assert.deepEqual(detailsOf(run.events), [chat(1)]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=2 sent=1 left=1 stop=store');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 left=2 stop=store');
+});
+
+test('the last detail record\'s key, written after the reads, counts it as left when it is not kept', async () => {
+  const side = rexSpider({ unkeptStamps: true });
+  const run = await pass(site({ main: [listed(1, 1)] }), side);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1 left=1 stop=store');
 });
 
 test('the detail budget is 360 s of reading', () => {
@@ -400,7 +474,24 @@ test('the detail budget counts the reading: at 100 s a read, the reads stop afte
   const run = await pass(site({ main }), side, { readMs: 100_000 });
   assert.deepEqual(detailsOf(run.events), [chat(1), chat(2), chat(3), chat(4)]);
   assert.deepEqual(side.stamps, [1, 2, 3, 4].map((n) => keyOf(n, n, 'detail')));
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=6 sent=4 left=2 stop=budget');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=6 dispatched=4 left=2 stop=budget');
+});
+
+test('the budget starts at the first detail read: a list walk that takes longer than the budget does not starve the reads', async () => {
+  const main = [1, 2, 3].map((n) => listed(n, n));
+  // Six requests before the reads (the home page and five list pages) at 100 s each.
+  const run = await pass(site({ main }), rexSpider(), { listMs: 100_000 });
+  assert.deepEqual(detailsOf(run.events), [chat(1), chat(2), chat(3)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=3');
+});
+
+test('store calls during the reads count against the budget: at 100 s a stamp, the reads stop after five', async () => {
+  const main = [1, 2, 3, 4, 5, 6].map((n) => listed(n, n));
+  const side = rexSpider();
+  const run = await pass(site({ main }), side, { stampMs: 100_000 });
+  assert.deepEqual(detailsOf(run.events), [1, 2, 3, 4, 5].map(chat));
+  assert.deepEqual(side.stamps, [1, 2, 3, 4, 5].map((n) => keyOf(n, n, 'detail')));
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=6 dispatched=5 left=1 stop=budget');
 });
 
 test('the paced waits do not count against the budget: twenty reads 30 s apart all go out', async () => {
@@ -408,7 +499,7 @@ test('the paced waits do not count against the budget: twenty reads 30 s apart a
   const run = await pass(site({ main }), rexSpider());
   assert.equal(detailsOf(run.events).length, 20);
   assert.ok(run.clock() - NOW > 600_000, 'the waits took less than the budget');
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=20 sent=20');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=20 dispatched=20');
 });
 
 test('nor does a wait that runs longer than it asked: it is measured on the clock', async () => {
@@ -434,7 +525,7 @@ test('summarize served during the detail reads ends them; the chats sent keep th
   const run = await pass(web, side, { core });
   assert.deepEqual(detailsOf(run.events), [chat(1), chat(2)]);
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail'), keyOf(2, 2, 'detail')]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=4 sent=2 left=2 stop=mode');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=4 dispatched=2 left=2 stop=mode');
   summarize = true;
   const next = await pass(site({ main }), side, { core });
   assert.deepEqual(detailsOf(next.events), []);
@@ -450,7 +541,7 @@ test('detail served during a summary pass ends it too, and what went out is stam
   const run = await pass(site({ main: [listed(1, 1), listed(2, 2), listed(3, 3)] }), side);
   assert.deepEqual(run.sent.map((record) => record.identifier), [chat(1)]);
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'summary')]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=3 sent=1 left=2 stop=mode');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=1 left=2 stop=mode');
 });
 
 test('enabled false served during the detail reads stops them before the next request', async () => {
@@ -459,7 +550,7 @@ test('enabled false served during the detail reads stops them before the next re
   const run = await pass(web, side);
   assert.deepEqual(detailsOf(run.events), [chat(1), chat(2)]);
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail'), keyOf(2, 2, 'detail')]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=4 sent=2 left=2 stop=disabled');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=4 dispatched=2 left=2 stop=disabled');
 });
 
 test('a switch-off served while the mode record is read stops the pass before any request', async () => {
@@ -469,6 +560,14 @@ test('a switch-off served while the mode record is read stops the pass before an
   assert.deepEqual(web.requests, []);
   assert.deepEqual(run.outcome, { count: -1, ids: [], reason: run.outcome.reason });
   assert.equal(withoutMs(run.outcome.reason), 'disabled stage=start');
+});
+
+test('a switch-off served while the crawl window is looked up stops the pass before the home page', async () => {
+  let enabled = true;
+  const web = site({ main: [listed(1, 1)] });
+  const run = await pass(web, rexSpider({ enabled: () => enabled, onWindow: () => { enabled = false; } }));
+  assert.deepEqual(web.requests, []);
+  assert.deepEqual([run.outcome.count, withoutMs(run.outcome.reason)], [-1, 'disabled stage=start']);
 });
 
 test('a switch-off served during the list walk stops it before its next request, with no reading of the list', async () => {
@@ -483,15 +582,24 @@ test('archived and starred chats are held back when the project lists were not r
   const side = rexSpider({ summarize: true });
   const run = await pass(web, side);
   assert.deepEqual(run.sent.map((record) => record.identifier), [chat(1)]);
-  assert.deepEqual(run.outcome.ids, [chat(1), chat(2), chat(3)]);
-  assert.equal(withoutMs(run.outcome.reason), 'partial listed=3 sent=1 held=2');
+  assert.deepEqual([run.outcome.count, run.outcome.ids], [-1, []]);
+  assert.equal(withoutMs(run.outcome.reason), 'partial seen=3 dispatched=1 held=2');
+});
+
+test('a list read in part is no reading of the account: count -1 and no ids, so the chats it missed do not read as deleted, while the reason says what went out', async () => {
+  const main = Array.from({ length: 30 }, (_, k) => listed(k + 1, k + 1));
+  const web = site({ main, answers: { 'main 28': json({ detail: `${MARK} broke` }, 500) } });
+  const run = await pass(web, rexSpider({ summarize: true }));
+  assert.equal(run.sent.length, 28);
+  assert.deepEqual([run.outcome.count, run.outcome.ids], [-1, []]);
+  assert.equal(withoutMs(run.outcome.reason), 'partial seen=28 dispatched=28');
 });
 
 test('they are sent when the project lists were read whole', async () => {
   const web = site({ main: [listed(1, 1)], archived: [listed(2, 2, { is_archived: true })], starred: [listed(3, 3, { is_starred: true })] });
   const run = await pass(web, rexSpider({ summarize: true }));
   assert.deepEqual(run.sent.map((record) => record.identifier), [chat(1), chat(2), chat(3)]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=3 sent=3');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=3 dispatched=3');
 });
 
 test('a list read only in part that gives no chat is no reading of the account: count -1, never an empty list', async () => {
@@ -503,7 +611,7 @@ test('a list read only in part that gives no chat is no reading of the account: 
 
 test('a list read whole with no chat in the window is an empty reading: count 0', async () => {
   const run = await pass(site(), rexSpider({ summarize: true }));
-  assert.deepEqual([run.outcome.count, run.outcome.ids, withoutMs(run.outcome.reason)], [0, [], 'ok listed=0 sent=0']);
+  assert.deepEqual([run.outcome.count, run.outcome.ids, withoutMs(run.outcome.reason)], [0, [], 'ok seen=0 dispatched=0']);
 });
 
 test('the list walk reads the crawl window rex-spider gives', async () => {
@@ -566,6 +674,19 @@ test('a detail that gives no record sends nothing for its chat and stamps no key
   assert.equal(side.stamps.some((key) => key.startsWith(chat(1))), false);
 });
 
+// A builder that throws on one chat's detail (no input is known to make the
+// real one throw; this stands in for a fault in a later build).
+const throwsOn = (id: string): typeof buildDetailRecord => async (json, item, hash) => {
+  if (item.id === id) throw new TypeError('the builder broke');
+  return buildDetailRecord(json, item, hash);
+};
+
+test('a record builder that throws on a chat\'s detail fails that read, and does not end the pass as an internal error', async () => {
+  const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), rexSpider(), { detailBuilder: throwsOn(chat(1)) });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=0 failed=1 left=2 stop=failed-reads');
+});
+
 test('a wait that rejects ends the pass with a reason, and runPass does not throw', async () => {
   let calls = 0;
   let throwAt = 0;
@@ -583,7 +704,7 @@ test('a wait that rejects ends the pass with a reason, and runPass does not thro
   const side = rexSpider();
   const reads = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), side, { sleep: failing });
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail')]);
-  assert.equal(withoutMs(reads.outcome.reason), 'ok listed=2 sent=1 left=1 stop=internal');
+  assert.equal(withoutMs(reads.outcome.reason), 'ok seen=2 dispatched=1 left=1 stop=internal');
 });
 
 test('a dispatch that throws stops the sending, and its chat gets no key', async () => {
@@ -591,7 +712,7 @@ test('a dispatch that throws stops the sending, and its chat gets no key', async
   const run = await pass(site({ main: [listed(1, 1), listed(2, 2)] }), side, { dispatchThrowsOn: chat(2) });
   assert.deepEqual(run.sent.map((record) => record.identifier), [chat(1)]);
   assert.deepEqual(side.stamps, [keyOf(1, 1, 'summary')]);
-  assert.equal(withoutMs(run.outcome.reason), 'ok listed=2 sent=1 left=1 stop=internal');
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=2 dispatched=1 left=1 stop=internal');
 });
 
 test('a switch-off before the pass starts sends no request', async () => {

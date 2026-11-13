@@ -5,11 +5,13 @@
 // cannot reach the completion event.
 //
 // ok and partial are the passes that read the list: the whole of it, or only
-// part (a list that failed or was cut). Their count is the records sent and
-// their ids the chats listed in the crawl window. stop says why the sending
+// part (a list that failed or was cut). seen is the chats listed in the
+// crawl window and dispatched the records sent, named as the other crawler's
+// reasons name them so one script reads both. stop says why the sending
 // ended before every chat due was handled, and is absent when it did not;
-// left is how many due chats it did not reach, which a later pass sends.
-// Every other code is a pass with no reading of the list, count -1.
+// left is how many due chats a later pass sends. Only ok comes with a count
+// of 0 or more and the chats' ids: partial, like every other code, comes
+// with -1 and no ids, since a list read in part would read as chats deleted.
 
 // Why the sending of a pass that read the list ended early. budget: the
 // detail reads spent the pass's reading time; mode: summarize was served
@@ -34,13 +36,16 @@ const home = { kind: 'enum', values: ['home'] } as const;
 // What the pass had read and sent when it ended. ms, the pass's wall-clock
 // time, ends every reason.
 const sending = {
-  listed: count, sent: count, failed: optionalCount, held: optionalCount, left: optionalCount, stop: { kind: 'enum', values: STOPS, optional: true }, ms: count,
+  seen: count, dispatched: count, failed: optionalCount, held: optionalCount, left: optionalCount, stop: { kind: 'enum', values: STOPS, optional: true }, ms: count,
 } as const;
 
 export const CATALOGUE = {
   // failed: detail reads that failed; held: chats held back for a later
   // pass (an archived or starred chat while the projects were not read
-  // whole, or one whose memo of a failed read holds it or got no answer).
+  // whole, a chat sent only in the other mode while the mode record could
+  // not be read, or one whose memo of a failed read holds it or got no
+  // answer); left: as above, the chats not reached and those sent whose key
+  // was not kept.
   ok: sending,
   partial: sending,
   // The list was read only in part and gave no chat in the crawl window: an

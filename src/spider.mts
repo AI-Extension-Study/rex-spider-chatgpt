@@ -29,6 +29,12 @@ export class ChatGPTSpider extends REXSpider {
   // only ever turns off.
   haltsOnError = true;
 
+  // Whether a pass is running, set the moment a crawl starts. rex-spider's
+  // own flag is set only once rex-core has stored the crawl's start, so a
+  // second round could start a second pass before it, and two passes would
+  // read details at once.
+  passRunning = false;
+
   // rex-spider calls this on each refresh whose config has a block for this
   // spider or a default one, with the blocks merged. With neither, what was
   // last served stays until the worker restarts, as enabled does.
@@ -44,6 +50,11 @@ export class ChatGPTSpider extends REXSpider {
 
   continueAfterError(): boolean {
     return !this.haltsOnError;
+  }
+
+  // rex-spider skips a spider that says it is crawling, and records that.
+  isCrawling(): boolean {
+    return this.passRunning || super.isCrawling();
   }
 
   // As before. Nothing in rex-spider calls it.
@@ -95,8 +106,21 @@ export class ChatGPTSpider extends REXSpider {
 
   // The base stamps the crawl's start and sets its crawling flag. The pass
   // never throws, and its outcome is the crawl's one completion event, which
-  // clears the flag again.
+  // clears the flag again. A crawl started while a pass runs starts none and
+  // sends no event, so the running pass's flag stays as it is.
   async doBackgroundCrawl(): Promise<REXSpiderCrawlResult> {
+    if (this.passRunning) {
+      return { sitesCrawled: [this.identifier()], issues: [{ url: this.loginUrl(), message: 'a pass is already running' }] };
+    }
+    this.passRunning = true;
+    try {
+      return await this.crawlOnce();
+    } finally {
+      this.passRunning = false;
+    }
+  }
+
+  private async crawlOnce(): Promise<REXSpiderCrawlResult> {
     const result = await super.doBackgroundCrawl();
     const outcome = await runPass({
       client: (token) => createClient({ token, keepAlive }),
