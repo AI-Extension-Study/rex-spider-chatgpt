@@ -10,9 +10,10 @@ import { type Answer } from '../../src/client.mts';
 import { type ListItem, walkLists } from '../../src/list.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
 import { redactChatGPT } from '../../src/redact.mts';
+import { skeletonOf } from '../../src/skeleton.mts';
 import {
   CHAT_ID, LIST_CREATED, MARK, PROJECT_ID, ROOT, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, listItem,
-  nodeId, nodeOf, projectItem, prompt, reasoningDetail, reference, searchCall, systemMessage, toolResult, tree,
+  nodeId, nodeOf, oddTree, projectItem, prompt, reasoningDetail, reference, searchCall, systemMessage, toolResult, tree,
 } from './fixtures.mts';
 
 type Json = Record<string, unknown>;
@@ -32,10 +33,31 @@ function walked(value: unknown): unknown {
 }
 const wire = (value: unknown): string => JSON.stringify(walked(value));
 
+// The builders' record as the one id rule leaves it: a mapping entry whose
+// key is outside the rule is gone and the turns read incomplete, and a
+// turn's identifier or parent, or current_node, outside it reads null.
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const inIdForm = (id: unknown): boolean => id === ROOT || (typeof id === 'string' && UUID_SHAPE.test(id));
+function underIdRule(record: Json): Json {
+  const expected = plain(record);
+  if (expected.is_summary !== false) return expected;
+  const metadata = expected.metadata as Json;
+  const mapping = metadata.mapping as Json;
+  const kept = Object.fromEntries(Object.entries(mapping).filter(([key]) => inIdForm(key)));
+  const orNull = (id: unknown) => (inIdForm(id) ? id : null);
+  return {
+    ...expected,
+    turns: (expected.turns as Json[]).map((turn) => ({ ...turn, identifier: orNull(turn.identifier), parent: orNull(turn.parent) })),
+    turns_complete: expected.turns_complete === true && Object.keys(kept).length === Object.keys(mapping).length,
+    metadata: { ...metadata, current_node: inIdForm(metadata.current_node) && Object.hasOwn(kept, metadata.current_node as string) ? metadata.current_node : null, mapping: kept },
+  };
+}
+
 const API = 'https://chatgpt.com/backend-api';
 // The items the list walk reads when the lists hold these; the sidebar names
 // the fixtures' one project.
-async function listed(lists: { main?: unknown[]; archived?: unknown[]; starred?: unknown[]; project?: unknown[] }): Promise<ListItem[]> {
+type Lists = { main?: unknown[]; archived?: unknown[]; starred?: unknown[]; project?: unknown[] };
+async function walk(lists: Lists): Promise<{ items: ListItem[]; outcome: string; reason: string }> {
   const pages: Record<string, unknown> = {
     [`${API}/conversations?offset=0&limit=28&order=updated&is_archived=false&is_starred=false`]: { items: lists.main ?? [] },
     [`${API}/conversations?offset=0&limit=28&order=updated&is_archived=true`]: { items: lists.archived ?? [] },
@@ -44,7 +66,10 @@ async function listed(lists: { main?: unknown[]; archived?: unknown[]; starred?:
     [`${API}/gizmos/${PROJECT_ID}/conversations?cursor=0`]: { items: lists.project ?? [], cursor: null },
   };
   const client = { get: async (url: string): Promise<Answer> => ({ status: 200, headers: {}, text: JSON.stringify(pages[url] ?? { items: [] }) }) };
-  const result = await walkLists(client, { start: null, end: null }, { crawlDelay: () => 0, sleep: async () => {} }, { log: () => {} });
+  return walkLists(client, { start: null, end: null }, { crawlDelay: () => 0, sleep: async () => {} }, { log: () => {} });
+}
+async function listed(lists: Lists): Promise<ListItem[]> {
+  const result = await walk(lists);
   assert.equal(result.outcome, 'whole', `Test setup invalid: ${result.reason}`);
   return result.items;
 }
@@ -66,6 +91,35 @@ async function detailOf(chat: unknown): Promise<Json> {
   return record;
 }
 
+const upper = (n: number) => nodeId(n).toUpperCase();
+// Each kind of tree, as GET /backend-api/conversation/{id} sends it, with
+// every node id in the id form.
+const CHATS: ReadonlyArray<[string, () => Json]> = [
+  ['the small chat', smallChat],
+  ['an edited first prompt', editedFirstPromptDetail],
+  ['a reasoning reply', reasoningDetail],
+  ['a chat from the app, with no current node', () => detail(tree([nodeId(50), null, null], [nodeId(1), nodeId(50), prompt(nodeId(1), T0 + 1)], [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, MARK)]), undefined)],
+  ['no create_time, so no started', () => ({ ...smallChat(), create_time: null })],
+  ['a project chat, starred and pinned, with hidden context, an image and an attachment', () => detail(tree(
+    [ROOT, null, null],
+    [nodeId(11), ROOT, hiddenContext(nodeId(11))],
+    [nodeId(1), nodeId(11), { ...prompt(nodeId(1), T0 + 1), content: { content_type: 'multimodal_text', parts: [imagePart(1), `${MARK} see`] }, metadata: { attachments: [attachment(1)] } }],
+    [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} answer`)],
+  ), nodeId(2), { gizmo_id: `g-p-${MARK}gizmo`, conversation_template_id: `g-p-${MARK}template`, gizmo_type: 'snorlax', is_starred: true, pinned_time: T0 + 3 })],
+  ['a child and a parent the tree does not hold', () => {
+    const missing = detail(tree(
+      [ROOT, null, null], [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)], [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, MARK)], [nodeId(5), nodeId(4), prompt(nodeId(5), T0 + 5)],
+    ), nodeId(2));
+    (nodeOf(missing.mapping as Json, nodeId(2)).children as string[]).push(nodeId(9));
+    return missing;
+  }],
+  ['a message that cannot be read', () => detail(tree([ROOT, null, null], [nodeId(1), ROOT, { ...prompt(nodeId(1), T0 + 1), author: { role: 7 } }], [nodeId(2), nodeId(1), prompt(nodeId(2), T0 + 2)]), nodeId(2))],
+  ['node ids in capitals', () => detail(tree([ROOT, null, null], [upper(1), ROOT, prompt(upper(1), T0 + 1)], [upper(2), upper(1), answer(upper(2), T0 + 2, MARK)]), upper(2))],
+  // A null node, a node of no form, children null, an author that is null or
+  // a string, metadata that is not an object: shapes the skeleton keeps.
+  ['the odd nodes, under keys of the id form', () => detail(oddTree(nodeId), nodeId(1))],
+];
+
 // Every shape of record the builders make from the fixtures: summaries from
 // each list path, and details of each kind of tree.
 async function fixtureRecords(): Promise<Array<[string, Json]>> {
@@ -78,28 +132,7 @@ async function fixtureRecords(): Promise<Array<[string, Json]>> {
     project: [projectItem(chatId(2))],
   });
   const summaries = await Promise.all(items.map(async (item): Promise<[string, Json]> => [`summary from the ${item.source} list, ${item.id}`, await buildSummaryRecord(item, hash)]));
-  const missing = detail(tree(
-    [ROOT, null, null], [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)], [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, MARK)], [nodeId(5), nodeId(4), prompt(nodeId(5), T0 + 5)],
-  ), nodeId(2));
-  (nodeOf(missing.mapping as Json, nodeId(2)).children as string[]).push(nodeId(9));
-  const upper = (n: number) => nodeId(n).toUpperCase();
-  const chats: Array<[string, unknown]> = [
-    ['the small chat', smallChat()],
-    ['an edited first prompt', editedFirstPromptDetail()],
-    ['a reasoning reply', reasoningDetail()],
-    ['a chat from the app, with no current node', detail(tree([nodeId(50), null, null], [nodeId(1), nodeId(50), prompt(nodeId(1), T0 + 1)], [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, MARK)]), undefined)],
-    ['no create_time, so no started', { ...smallChat(), create_time: null }],
-    ['a project chat, starred and pinned, with hidden context, an image and an attachment', detail(tree(
-      [ROOT, null, null],
-      [nodeId(11), ROOT, hiddenContext(nodeId(11))],
-      [nodeId(1), nodeId(11), { ...prompt(nodeId(1), T0 + 1), content: { content_type: 'multimodal_text', parts: [imagePart(1), `${MARK} see`] }, metadata: { attachments: [attachment(1)] } }],
-      [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} answer`)],
-    ), nodeId(2), { gizmo_id: `g-p-${MARK}gizmo`, conversation_template_id: `g-p-${MARK}template`, gizmo_type: 'snorlax', is_starred: true, pinned_time: T0 + 3 })],
-    ['a child and a parent the tree does not hold', missing],
-    ['a message that cannot be read', detail(tree([ROOT, null, null], [nodeId(1), ROOT, { ...prompt(nodeId(1), T0 + 1), author: { role: 7 } }], [nodeId(2), nodeId(1), prompt(nodeId(2), T0 + 2)]), nodeId(2))],
-    ['node ids in capitals', detail(tree([ROOT, null, null], [upper(1), ROOT, prompt(upper(1), T0 + 1)], [upper(2), upper(1), answer(upper(2), T0 + 2, MARK)]), upper(2))],
-  ];
-  const details = await Promise.all(chats.map(async ([what, chat]): Promise<[string, Json]> => [`detail: ${what}`, await detailOf(chat)]));
+  const details = await Promise.all(CHATS.map(async ([what, chat]): Promise<[string, Json]> => [`detail: ${what}`, await detailOf(chat())]));
   return [...summaries, ...details];
 }
 const RECORDS = await fixtureRecords();
@@ -107,8 +140,26 @@ const recordOf = (what: string): Json => (RECORDS.find(([name]) => name.includes
 const SUMMARY = recordOf(`main list, ${CHAT_ID}`);
 const DETAIL = recordOf('the small chat');
 
+// What the case makes of a raw tree put in a record's mapping, and the
+// skeleton the builder writes for that tree, as the id rule leaves it: the
+// two must agree, so the case's forms are the builder's. The case never
+// reads a message's content, so content_type, which the builder takes from
+// content, reads null on a raw tree.
+const mappingOf = (tree: unknown): unknown => (redact({ ...DETAIL, metadata: { ...(DETAIL.metadata as Json), mapping: tree } }).metadata as Json).mapping;
+const skeletonUnderIdRule = (tree: unknown): Json => Object.fromEntries(Object.entries(skeletonOf(tree)).filter(([key]) => inIdForm(key)).map(([key, node]) => {
+  const message = (node as Json | null)?.message as Json | null | undefined;
+  return [key, message ? { ...(node as Json), message: { ...message, content_type: null } } : node];
+}));
+
 test('every record the builders make on the fixtures comes back equal, as built and as the walker leaves its times', () => {
-  assert.equal(RECORDS.length, 15, 'Test setup invalid: a fixture record is missing');
+  assert.equal(RECORDS.length, 16, 'Test setup invalid: a fixture record is missing');
+  const odd = Object.values(((recordOf('the odd nodes').metadata as Json).mapping) as Record<string, Json | null>);
+  const messages = odd.map((node) => node?.message as Json | null | undefined).filter((message) => message);
+  assert.ok(
+    odd.includes(null) && odd.some((node) => node?.children === null) && messages.some((message) => isDeepStrictEqual(message?.author, { role: null, name: null }))
+      && messages.some((message) => isDeepStrictEqual(message?.metadata, {})),
+    'Test setup invalid: the odd tree\'s record lacks a null node, children null, an empty author or empty message metadata',
+  );
   for (const [what, record] of RECORDS) {
     const times = (key: string, form: (date: DateString) => unknown) => (record[key] === undefined ? {} : { [key]: form(record[key] as DateString) });
     const forms: Array<[string, Json]> = [
@@ -119,10 +170,19 @@ test('every record the builders make on the fixtures comes back equal, as built 
     for (const [form, event] of forms) {
       const out = redact(event);
       assert.deepEqual(plain(out), plain(record), `${what}, ${form}`);
+      // As objects too, where a key whose value is undefined still shows.
+      assert.deepEqual([Object.keys(out).sort(), out.turns, out.metadata], [Object.keys(record).sort(), record.turns, record.metadata], `${what}, ${form}: keys`);
       // Turn keys go in the standard's order, and metadata in the builders'.
       assert.equal(JSON.stringify([out.turns, out.metadata]), JSON.stringify([record.turns, record.metadata]), `${what}, ${form}: key order`);
       assert.ok(out.ended instanceof DateString && (record.started === undefined || out.started instanceof DateString), `${what}, ${form}: a time is not a DateString`);
     }
+  }
+});
+
+test('a raw tree in the mapping comes back as the skeleton the builder writes for it, as the id rule leaves it', () => {
+  const trees: Array<[string, unknown]> = [...CHATS.map(([what, chat]): [string, unknown] => [what, chat().mapping]), ['the odd nodes, under their own keys', oddTree()]];
+  for (const [what, tree] of trees) {
+    assert.deepEqual(mappingOf(tree), skeletonUnderIdRule(tree), what);
   }
 });
 
@@ -218,7 +278,7 @@ test('a value out of its form is null, and a string out of its type name or clos
       { ...reply, parent: ROOT, when: '2026-13-10T14:00:31.871Z', model_slug: 'GPT 5', status: 7, content_type: null },
     ],
     metadata: {
-      ...metadata, conversation_id: 'chat one', create_time: T0 * 1000, default_model_slug: 'GPT-5', is_starred: false, is_archived: 'no', memory_scope: 7,
+      ...metadata, conversation_id: 'chat one', create_time: T0 * 1000, update_time: 5, default_model_slug: 'GPT-5', is_starred: false, is_archived: 'no', memory_scope: 7,
       current_node: nodeId(99), gizmo_type: 'Snorlax', title_hash: 'F'.repeat(64),
       mapping: {
         ...mapping,
@@ -239,8 +299,8 @@ test('a value out of its form is null, and a string out of its type name or clos
   assert.deepEqual((odd.turns as Json[])[1], { ...reply, parent: ROOT, when: null, model_slug: 'unrecognised', status: null, content_type: null });
   const kept = odd.metadata as Json;
   assert.deepEqual(
-    [kept.conversation_id, kept.create_time, kept.default_model_slug, kept.is_starred, kept.is_archived, kept.memory_scope, kept.current_node, kept.gizmo_type, kept.title_hash],
-    [null, null, 'unrecognised', null, null, null, null, 'unrecognised', null],
+    [kept.conversation_id, kept.create_time, kept.update_time, kept.default_model_slug, kept.is_starred, kept.is_archived, kept.memory_scope, kept.current_node, kept.gizmo_type, kept.title_hash],
+    [null, null, null, 'unrecognised', null, null, null, null, 'unrecognised', null],
   );
   const nodes = kept.mapping as Record<string, Json>;
   // The tree's status is a type name, so a lowercase server value stays; a turn's is the closed set.
@@ -418,6 +478,80 @@ test('2,000 single-field departures from records the builders make: none throws,
   // Both ways out were taken, so the departures reached the record checks and the field forms alike.
   assert.ok(outcomes.kept > 500 && outcomes.cut > 100, JSON.stringify(outcomes));
   t.diagnostic(`${outcomes.kept} kept as records, ${outcomes.cut} cut to the scaffold`);
+});
+
+// Values JSON can carry, each in or out of a form some field is held to.
+const RAW_VALUES: readonly unknown[] = [
+  null, 0, -1, 1.5, 5, T0, T0 * 1000, true, false, '', 'x', MARK, `${MARK} text`, 'Text', 'text', 'gpt-5', 'user', 'assistant', 'tool', 'system',
+  'all', 'web', 'finished_successfully', 'in_progress', 'finished_partial_completion', 'thoughts', 'multimodal_text', ROOT, nodeId(1), nodeId(4),
+  nodeId(99), upper(5), 'msg_0002', `${nodeId(5)}${MARK}`, `${ROOT}${MARK}`, LIST_CREATED, '2026-13-08T13:48:43Z', '2026-09-08T13:48:43+05:30',
+  `${LIST_CREATED}[x=${MARK}]`, 'f'.repeat(64), `${'f'.repeat(64)}${MARK}`, 'x'.repeat(65), [], [MARK], [nodeId(1)], {}, { text: MARK }, { role: 'user' },
+  { content_type: 'text', parts: [MARK] },
+];
+const NEW_KEYS = [nodeId(98), upper(3), 'msg_0003', `${MARK} key`, ROOT];
+
+// One or two departures from a raw chat or list item, as JSON can make
+// them: a value set anywhere (the chat's own id left alone), a key deleted,
+// or a mapping key renamed, its links as they were.
+function departRaw(raw: Json, random: () => number): Json {
+  const event = JSON.parse(JSON.stringify(raw)) as Json;
+  for (let n = 1 + Math.floor(random() * 2); n > 0; n -= 1) {
+    const places = placesOf(event).filter((path) => path.length > 1 || (path[0] !== 'id' && path[0] !== 'conversation_id'));
+    const path = places[Math.floor(random() * places.length)];
+    const target = path.slice(0, -1).reduce((at: Json, key) => at[key] as Json, event);
+    const key = path[path.length - 1];
+    const roll = random();
+    if (roll < 0.15) {
+      delete target[key];
+    } else if (roll < 0.3 && path[path.length - 2] === 'mapping' && Object.hasOwn(target, key)) {
+      const name = NEW_KEYS[Math.floor(random() * NEW_KEYS.length)];
+      target[name] = target[key];
+      if (name !== key) delete target[key];
+    } else {
+      target[key] = RAW_VALUES[Math.floor(random() * RAW_VALUES.length)];
+    }
+  }
+  return JSON.parse(JSON.stringify(event)) as Json;
+}
+
+test('2,000 seeded departures of the raw chats and list items: every record the builders make comes back as the id rule leaves it', async (t) => {
+  const random = seeded(20261113);
+  const chats: ReadonlyArray<[string, () => Json]> = [...CHATS, ['the odd nodes, under their own keys', () => detail(oddTree(), nodeId(1))]];
+  const lists: ReadonlyArray<[keyof Lists, () => Json]> = [
+    ['main', () => listItem(CHAT_ID)], ['project', () => projectItem(CHAT_ID)], ['archived', () => listItem(CHAT_ID, { is_archived: true })],
+    ['starred', () => listItem(CHAT_ID, { is_starred: true, pinned_time: LIST_CREATED })],
+  ];
+  const tally = { details: 0, summaries: 0, none: 0, changed: 0 };
+  for (let n = 0; n < 2000; n += 1) {
+    let record: Json | null;
+    let what: string;
+    if (random() < 0.75) {
+      const [name, chat] = chats[Math.floor(random() * chats.length)];
+      what = `departure ${n} of ${name}`;
+      const raw = departRaw(chat(), random);
+      assert.deepEqual(mappingOf(raw.mapping), skeletonUnderIdRule(raw.mapping), `${what}: its raw tree in the mapping`);
+      record = await buildDetailRecord(raw, MAIN_ITEM, hash);
+    } else {
+      const [list, item] = lists[Math.floor(random() * lists.length)];
+      what = `departure ${n} of a ${list} list item`;
+      const [listedItem] = (await walk({ [list]: [departRaw(item(), random)] })).items;
+      record = listedItem === undefined ? null : await buildSummaryRecord(listedItem, hash);
+    }
+    if (record === null) {
+      tally.none += 1;
+      continue;
+    }
+    tally[record.is_summary === true ? 'summaries' : 'details'] += 1;
+    const expected = underIdRule(record);
+    if (!isDeepStrictEqual(expected, plain(record))) tally.changed += 1;
+    const out = redact(record);
+    assert.deepEqual(plain(out), expected, what);
+    assert.deepEqual([Object.keys(out).sort(), out.turns, out.metadata], [Object.keys(expected).sort(), expected.turns, expected.metadata], `${what}: keys`);
+    assert.equal(JSON.stringify([out.turns, out.metadata]), JSON.stringify([expected.turns, expected.metadata]), `${what}: key order`);
+    assert.equal(wire(out).includes(MARK), false, what);
+  }
+  t.diagnostic(`${tally.details} details and ${tally.summaries} summaries, ${tally.changed} of them changed by the id rule; ${tally.none} departures gave no record`);
+  assert.ok(tally.details > 1000 && tally.summaries > 300 && tally.changed > 50, JSON.stringify(tally));
 });
 
 test('the redactor imports nothing but rex-types, so the extension can carry a copy of it', () => {
