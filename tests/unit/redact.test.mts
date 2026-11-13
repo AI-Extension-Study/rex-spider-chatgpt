@@ -328,3 +328,76 @@ test('it never throws: a field that throws, a proxy, or no object at all gives t
     assert.deepEqual(redact(value), {});
   }
 });
+
+// A seeded generator (mulberry32), so every run makes the same departures.
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), state | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// A copy to change: objects and lists copied, a DateString as one, its
+// Temporal instant shared, since an instant never changes.
+function copy(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(copy);
+  if (value instanceof DateString) return Object.assign(Object.create(DateString.prototype), { value: value.value, originalValue: value.originalValue });
+  if (Object.prototype.toString.call(value) !== '[object Object]') return value;
+  return Object.fromEntries(Object.entries(value as Json).map(([key, held]) => [key, copy(held)]));
+}
+
+// Each place one departure can go: every key of every object and list in a
+// record, a DateString's two included, and one key more on each.
+function placesOf(value: unknown, path: string[] = []): string[][] {
+  if (!Array.isArray(value) && !(value instanceof DateString) && Object.prototype.toString.call(value) !== '[object Object]') return [];
+  const keys = Object.keys(value as object);
+  return [[...path, Array.isArray(value) ? String(value.length) : `${MARK}_key`], ...keys.flatMap((key) => [[...path, key], ...placesOf((value as Json)[key], [...path, key])])];
+}
+
+const PROBES: ReadonlyArray<[string, (() => unknown) | 'delete' | 'throws']> = [
+  ['deleted', 'delete'], ['a getter that throws', 'throws'], ['undefined', () => undefined], ['null', () => null], ['an empty string', () => ''],
+  ['text', () => `${MARK} text`], ['the marker', () => MARK], ['zero', () => 0], ['minus one', () => -1], ['a fraction', () => 1.5],
+  ['not a number', () => Number.NaN], ['infinity', () => Number.POSITIVE_INFINITY], ['an unsafe integer', () => Number.MAX_SAFE_INTEGER + 2], ['true', () => true],
+  ['false', () => false], ['an empty object', () => ({})], ['an object holding text', () => ({ text: MARK, 'content*': MARK })], ['an empty list', () => []],
+  ['a list holding text', () => [MARK, { title: MARK }]], ['an impossible time', () => '2026-13-08T13:48:43Z'], ['another instant', () => '2026-01-01T00:00:00Z'],
+  ['epoch seconds', () => T0], ['epoch ms', () => T0 * 1000], ['a node id', () => nodeId(99)], ['the browser root', () => ROOT], ['a chat id', () => CHAT_ID],
+  ['a type name', () => 'unrecognised'], ['a digest', () => 'f'.repeat(64)], ['a digest in capitals', () => 'F'.repeat(64)], ['a long type name', () => 'x'.repeat(65)],
+  ['a DateString of text', () => Object.assign(Object.create(DateString.prototype), { value: null, originalValue: `other:${MARK}` })],
+  ['a DateString of another instant', () => new DateString(T0 + 1)], ['an instant look-alike', () => ({ toString: () => '2026-01-01T00:00:00Z', toJSON: () => MARK })],
+];
+
+function departed(record: Json, path: string[], probe: (() => unknown) | 'delete' | 'throws'): Json {
+  const event = copy(record) as Json;
+  const target = path.slice(0, -1).reduce((at: Json, key) => at[key] as Json, event);
+  const key = path[path.length - 1];
+  if (probe === 'delete') delete target[key];
+  else if (probe === 'throws') Object.defineProperty(target, key, { enumerable: true, get: () => { throw new Error(MARK); } });
+  else target[key] = probe();
+  return event;
+}
+
+test('2,000 single-field departures from records the builders make: none throws, none lets a marker out, nothing is printed', (t) => {
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => printed.push(args.map(String).join(' ')));
+  const random = seeded(20261112);
+  const pick = <T,>(list: readonly T[]): T => list[Math.floor(random() * list.length)];
+  const bases = [SUMMARY, recordOf('project list'), DETAIL, recordOf('a reasoning reply')].map((record): [Json, string[][]] => [record, placesOf(record)]);
+  const outcomes = { kept: 0, cut: 0 };
+  for (let n = 0; n < 2000; n += 1) {
+    const [record, places] = pick(bases);
+    const path = pick(places);
+    const [probe, value] = pick(PROBES);
+    const what = `${String(record.identifier)} ${String(record.is_summary)}: ${path.join('.')} ${probe}`;
+    let out: Json = {};
+    assert.doesNotThrow(() => { out = redact(departed(record, path, value)); }, what);
+    assert.equal(wire(out).includes(MARK), false, what);
+    outcomes[typeof out.is_summary === 'boolean' ? 'kept' : 'cut'] += 1;
+  }
+  assert.deepEqual(printed, []);
+  // Both ways out were taken, so the departures reached the record checks and the field forms alike.
+  assert.ok(outcomes.kept > 500 && outcomes.cut > 100, JSON.stringify(outcomes));
+  t.diagnostic(`${outcomes.kept} kept as records, ${outcomes.cut} cut to the scaffold`);
+});
