@@ -88,6 +88,18 @@ test('get sends the token as a bearer header, and nothing else in the headers', 
   assert.deepEqual(calls[0].init.headers, { Authorization: 'Bearer TOKEN-VALUE' });
 });
 
+// The home page, which the token is read from, was always fetched with no
+// header at all.
+test('get with no token sends no header', async () => {
+  const calls: Call[] = [];
+  const client = createClient({ fetch: respond(() => new Response('<html></html>'), calls) });
+  await client.get('https://chatgpt.com/');
+  assert.equal(calls[0].url, 'https://chatgpt.com/');
+  assert.equal(calls[0].init.method, 'GET');
+  assert.deepEqual(calls[0].init.headers, {});
+  assert.deepEqual(Object.keys(calls[0].init).sort(), ['headers', 'method', 'signal']);
+});
+
 test('get hands fetch only the method, the headers and the abort signal, as the list calls always have: no credentials or other option', async () => {
   const calls: Call[] = [];
   const client = createClient({ token: 'T', fetch: respond(() => new Response('{}'), calls) });
