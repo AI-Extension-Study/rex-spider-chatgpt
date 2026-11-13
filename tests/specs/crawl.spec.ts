@@ -475,3 +475,43 @@ test('a token that expires between two detail reads ends the pass as signed out,
   expect(completions(second.events)).toEqual([[2, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=2')]])
   await expectAllRouted(serviceWorker, site, unrouted)
 })
+
+// Archived and starred chats are collected too. The spider's own list leaves
+// both out, so two more lists reach them, and a chat two lists name
+// (archived and starred, or starred and in a project) is one chat, taken
+// from the list the spider may already have keyed it on: a project before
+// the starred list.
+test('archived and starred chats go out once each, a starred project chat under the project path\'s key, and the next crawl sends none', async ({ context, serviceWorker, unrouted }) => {
+  const site = new Site()
+  const archived = { is_archived: true }
+  const starred = { is_starred: true, pinned_time: '2026-09-08T14:00:00.000000Z' }
+  site.main.push(mainItem(chat(1), Date.parse('2026-09-12T09:30:00.900Z')))
+  site.archived.push(mainItem(chat(2), Date.parse('2026-09-11T10:15:00.400Z'), archived), mainItem(chat(3), Date.parse('2026-09-10T11:45:00.600Z'), { ...archived, ...starred }))
+  site.starred.push(mainItem(chat(3), Date.parse('2026-09-10T11:45:00.600Z'), { ...archived, ...starred }), mainItem(chat(4), Date.parse('2026-09-08T13:49:43.781Z'), starred))
+  site.projects.set(PROJECT, [projectChat(chat(4), Date.parse('2026-09-08T13:49:43.781Z'), starred)])
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker, { summarize: true })
+
+  const first = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual(listWalk({ archived: true, starred: true, projects: [PROJECT] }))
+  const sent = records(first.events)
+  expect(sent.map((record) => record.identifier)).toEqual([chat(1), chat(2), chat(3), chat(4)])
+  expect(sent.flatMap((record) => checkRecord(record, MARK))).toEqual([])
+  // Each as its list gives it, the starred project chat as the project's
+  // item: archived, starred, and whether a project id is hashed.
+  expect(sent.map(({ metadata }) => [metadata.is_archived, metadata.is_starred, metadata.gizmo_id_hash !== null])).toEqual([
+    [false, null, false], [true, null, false], [true, true, false], [false, true, true],
+  ])
+  expect(completions(first.events)).toEqual([[4, [chat(1), chat(2), chat(3), chat(4)], reason('ok seen=4 dispatched=4')]])
+  // One key each; the starred project chat's 1 ms early, the project path's.
+  const keys = [uploadKey(chat(1), 1789205400900), uploadKey(chat(2), 1789121700400), uploadKey(chat(3), 1789040700600), uploadKey(chat(4), 1788875383780)]
+  expect(await uploadKeys(serviceWorker)).toEqual([...keys].sort())
+  expect(await rexSpiderKey(serviceWorker, chat(4), site.projects.get(PROJECT)[0].update_time, 'project')).toEqual(keys[3])
+
+  const second = await crawl(serviceWorker)
+  expect(site.calls).toEqual(listWalk({ archived: true, starred: true, projects: [PROJECT] }))
+  expect(records(second.events)).toEqual([])
+  expect(completions(second.events)).toEqual([[0, [chat(1), chat(2), chat(3), chat(4)], reason('ok seen=4 dispatched=0')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
