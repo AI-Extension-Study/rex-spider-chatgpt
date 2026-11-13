@@ -6,11 +6,12 @@
 // (never the content), and the ten metadata keys below, which hold ids, model
 // names and timings. Each value is held to the form the capture of 2026-11-12
 // saw for it, so a value in its form is copied unchanged and nothing else,
-// text included, reaches the record: a type name or a status of another form
-// becomes 'unrecognised', and an id, a time or a flag of another form, or a
-// value of another type, null. A node or a message that is not an object is
-// null. Pure.
-import { field, flag, isObject, statusOf, typeName } from './forms.mts';
+// text included, reaches the record: a type name of another form becomes
+// 'unrecognised', and an id, a time or a flag of another form, or a value of
+// another type, null. A node or a message that is not an object is null.
+// The status is a type name here, so a server status the turn's closed set
+// does not hold (finished_partial_completion, say) stays as it came. Pure.
+import { field, flag, isObject, typeName } from './forms.mts';
 
 // The capture saw a UUID in every message id, parent and child, and in every
 // request_id, turn_exchange_id and working_turn_id; the root a browser makes
@@ -50,7 +51,7 @@ function keepMessage(message: Readonly<Record<string, unknown>>): Record<string,
     author: { role: typeName(field(author, 'role')), name: typeName(field(author, 'name')) },
     create_time: finiteOrNull(field(message, 'create_time')),
     update_time: finiteOrNull(field(message, 'update_time')),
-    status: statusOf(field(message, 'status')),
+    status: typeName(field(message, 'status')),
     weight: finiteOrNull(field(message, 'weight')),
     end_turn: flag(field(message, 'end_turn')),
     recipient: typeName(field(message, 'recipient')),

@@ -574,6 +574,23 @@ test('values in their forms reach the skeleton unchanged', () => {
   assert.deepEqual([(skeleton[ROOT] as Json).id, (skeleton[ROOT] as Json).parent, at(1).parent], [ROOT, null, ROOT]);
 });
 
+test('a status out of the closed set stays in the skeleton as the server wrote it, and reads unrecognised on the turn', () => {
+  const statuses = (status: string) => {
+    const parsed = parse(detail(tree(
+      [ROOT, null, null],
+      [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)],
+      [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} cut off`, { status })],
+    ), nodeId(2)));
+    return [((parsed.skeleton[nodeId(2)] as Json).message as Json).status, parsed.turns[1].status];
+  };
+  // A server status the turn's closed set does not hold, such as a reply cut off.
+  assert.deepEqual(statuses('finished_partial_completion'), ['finished_partial_completion', 'unrecognised']);
+  assert.deepEqual(statuses('in_progress'), ['in_progress', 'in_progress']);
+  // Spaces or capitals are no server status: stopped in both.
+  assert.deepEqual(statuses(`${MARK} cut off here`), ['unrecognised', 'unrecognised']);
+  assert.deepEqual(statuses('Finished'), ['unrecognised', 'unrecognised']);
+});
+
 test('every value of a message the skeleton copies is held to its form: text planted in any of them never reaches the parse', () => {
   const base = () => detail(tree(
     [ROOT, null, null],
