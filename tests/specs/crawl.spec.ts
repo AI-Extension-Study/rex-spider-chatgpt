@@ -159,9 +159,12 @@ async function expectAllRouted(serviceWorker, site, unrouted) {
 }
 
 test('served summarize, a crawl sends a summary per chat, newest first, keyed as rex-spider keys it on each list path, and the next crawl sends none', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
   const site = new Site()
-  // The project chat's time comes out 1 ms early on the project path.
-  site.main.push(mainItem(chat(1), Date.parse('2026-09-10T08:00:00.500Z')), mainItem(chat(2), Date.parse('2026-09-09T08:00:00.250Z')))
+  // The project chat falls between the two main-list chats in time, so
+  // newest first is not the walk's order (the main list, then the projects),
+  // and its time comes out 1 ms early on the project path.
+  site.main.push(mainItem(chat(1), Date.parse('2026-09-10T08:00:00.500Z')), mainItem(chat(2), Date.parse('2026-09-07T08:00:00.250Z')))
   site.projects.set(PROJECT, [projectChat(chat(3), Date.parse('2026-09-08T13:49:43.781Z'))])
   await answerChatGPT(context, site)
   await untilStoreOpen(serviceWorker)
@@ -171,17 +174,18 @@ test('served summarize, a crawl sends a summary per chat, newest first, keyed as
   expect(site.calls.splice(0)).toEqual(listWalk({ projects: [PROJECT] }))
   expect(first.result).toEqual({ sitesCrawled: ['chatgpt'], issues: [] })
   const sent = records(first.events)
-  expect(sent.map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), true], [chat(2), true], [chat(3), true]])
+  expect(sent.map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), true], [chat(3), true], [chat(2), true]])
   expect(sent.flatMap((record) => checkRecord(record, MARK))).toEqual([])
   expect(sent.map((record) => record.metadata.title_hash)).toEqual(Array(3).fill(sha256(`${MARK} list title`)))
-  expect(sent.map((record) => record.metadata.gizmo_id_hash)).toEqual([null, null, sha256(`g-p-${MARK}gizmo`)])
+  expect(sent.map((record) => record.metadata.gizmo_id_hash)).toEqual([null, sha256(`g-p-${MARK}gizmo`), null])
+  // The chats in the walk's order.
   expect(completions(first.events)).toEqual([[3, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=3')]])
 
   // The keys as stored: the bare chat id, the list's time in ms, and on the
   // project path 1 ms early, each the key rex-spider builds for the chat.
   const keys = [
     `rex-spider-chatgpt-conversation-upload-${chat(1)}-1789027200500`,
-    `rex-spider-chatgpt-conversation-upload-${chat(2)}-1788940800250`,
+    `rex-spider-chatgpt-conversation-upload-${chat(2)}-1788768000250`,
     `rex-spider-chatgpt-conversation-upload-${chat(3)}-1788875383780`,
   ]
   expect(await uploadKeys(serviceWorker)).toEqual([...keys].sort())
