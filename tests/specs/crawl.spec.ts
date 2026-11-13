@@ -11,11 +11,12 @@
 import crypto from 'node:crypto'
 
 import { test, expect } from './fixtures'
-import { MARK, ROUTE_NAME, Site, answerChatGPT, mainItem, projectChat } from './chatgpt-site'
+import { MARK, ROUTE_NAME, Site, answerChatGPT, daysAgo, mainItem, projectChat } from './chatgpt-site'
 import { checkRecord } from './standard-check'
 
 const chat = (n: number) => `6911f0a5-2222-8000-8000-${String(n).padStart(12, '0')}`
 const PROJECT = 'g-p-0000000000000000000000000000aaaa'
+const HOUR_MS = 60 * 60 * 1000
 const sha256 = (text: string) => crypto.createHash('sha256').update(text).digest('hex')
 
 // rex-core answers store messages only once its database is open; a crawl
@@ -117,6 +118,13 @@ async function rexSpiderKey(serviceWorker, id: string, updateTime: string, path:
   }, { id, updateTime, path })
 }
 
+// rex-core writes the install time once, when the extension is installed. A
+// spec moves it back to stand for an install some time ago.
+async function installedAt(serviceWorker, ms: number) {
+  await expect.poll(() => serviceWorker.evaluate(async () => (await chrome.storage.local.get('rexInstallTime')).rexInstallTime !== undefined)).toBe(true)
+  await serviceWorker.evaluate((ms) => chrome.storage.local.set({ rexInstallTime: ms }), ms)
+}
+
 // Every request the worker made went to chatgpt.com and was answered by the
 // route: the worker's own list of its requests, each with the route header
 // its answer came back with (tests/src/service-worker.ts), is the route's
@@ -166,5 +174,27 @@ test('served summarize, a crawl sends a summary per chat, newest first, keyed as
   expect(site.calls).toEqual(listWalk({ projects: [PROJECT] }))
   expect(records(second.events)).toEqual([])
   expect(completions(second.events)).toEqual([[0, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=0')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// The study's configs serve summarize with the crawl window anchored at
+// install: start -7776000000, 90 days before it. For an install a month ago
+// the window starts 120 days back, where one anchored at the crawl would
+// start 90 days back.
+test('served the study\'s window anchored at install, a summary crawl sends the chats last used since 90 days before the install, and no older one', async ({ context, serviceWorker, unrouted }) => {
+  const now = Date.now()
+  const site = new Site()
+  site.main.push(mainItem(chat(1), now - HOUR_MS), mainItem(chat(2), daysAgo(100, now)), mainItem(chat(3), daysAgo(125, now)))
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await installedAt(serviceWorker, daysAgo(30, now))
+  await serve(serviceWorker, { summarize: true, time_anchor: 'install', start: -7_776_000_000 })
+
+  const round = await crawl(serviceWorker)
+  expect(site.calls).toEqual(listWalk())
+  const sent = records(round.events)
+  expect(sent.map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), true], [chat(2), true]])
+  expect(sent.flatMap((record) => checkRecord(record, MARK))).toEqual([])
+  expect(completions(round.events)).toEqual([[2, [chat(1), chat(2)], reason('ok seen=2 dispatched=2')]])
   await expectAllRouted(serviceWorker, site, unrouted)
 })
