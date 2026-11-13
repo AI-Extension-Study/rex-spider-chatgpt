@@ -326,6 +326,40 @@ test('no detail record holds text from the chat', async () => {
   }
 });
 
+test('text planted in any value the skeleton copies never reaches the detail record', async () => {
+  const item = await one([listItem(CHAT_ID)]);
+  const text = `${MARK} planted text`;
+  const at = (chat: Json, n: number) => nodeOf(chat.mapping as Json, nodeId(n)).message as Json;
+  const KEPT = ['model_slug', 'resolved_model_slug', 'message_type', 'thinking_effort', 'finished_duration_sec', 'request_id', 'turn_exchange_id', 'working_turn_id'];
+  const plants: Array<[string, (chat: Json) => void]> = [
+    ['author.name', (chat) => ((at(chat, 3).author as Json).name = text)],
+    ['recipient', (chat) => (at(chat, 2).recipient = text)],
+    ['channel', (chat) => (at(chat, 4).channel = text)],
+    ['status', (chat) => (at(chat, 4).status = text)],
+    ['content_type', (chat) => ((at(chat, 3).content as Json).content_type = text)],
+    ['create_time', (chat) => (at(chat, 10).create_time = text)],
+    ...KEPT.map((key): [string, (chat: Json) => void] => [`metadata.${key}`, (chat) => ((at(chat, 4).metadata as Json)[key] = text)]),
+  ];
+  for (const [what, plant] of plants) {
+    const chat = smallDetail();
+    plant(chat);
+    // Built directly, so a failure names the field.
+    const record = await buildDetailRecord(chat, item, sha256);
+    assert.ok(record !== null, what);
+    assert.equal(JSON.stringify(record).includes(MARK), false, what);
+  }
+});
+
+test('the detail\'s gizmo_type is a type name: unrecognised for another string, null for no string', async () => {
+  const item = await one([listItem(CHAT_ID)]);
+  const gizmoType = async (value: unknown) => ((await detailOf({ ...smallDetail(), gizmo_type: value }, item))?.metadata as Json).gizmo_type;
+  assert.equal(await gizmoType('snorlax'), 'snorlax');
+  assert.equal(await gizmoType(`Snorlax ${MARK}`), 'unrecognised');
+  assert.equal(await gizmoType('x'.repeat(65)), 'unrecognised');
+  assert.equal(await gizmoType(5), null);
+  assert.equal(await gizmoType({ name: MARK }), null);
+});
+
 test('a hash that fails, or answers with anything but lowercase hex SHA-256, gives null: a title never goes out as itself', async () => {
   const item = await one([listItem(CHAT_ID)], []);
   const project = await one([], [projectItem(PROJECT_CHAT)]);
