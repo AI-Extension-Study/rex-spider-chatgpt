@@ -14,7 +14,7 @@ type Json = Record<string, unknown>;
 export const ROOT = 'client-created-root';
 export const nodeId = (n: number): string => `aaaaaaaa-0000-4000-8000-${String(n).padStart(12, '0')}`;
 export const CHAT_ID = '6911f0a5-2222-8000-8000-000000000001';
-const EXCHANGE = 'bbbbbbbb-0000-4000-8000-000000000001';
+export const EXCHANGE = 'bbbbbbbb-0000-4000-8000-000000000001';
 
 // 2026-11-10T14:00:05Z in epoch seconds, the form the detail writes times in.
 export const T0 = 1794319205;
@@ -283,4 +283,56 @@ export function reasoningDetail(): Json {
       metadata: { inline_cot_expandable_content: { search_result_groups: [group('inline', 200, 4)], summary: `${MARK} inline` } },
     })],
   ), nodeId(7));
+}
+
+// List items as the conversation lists send them, times as ISO strings with
+// microseconds. Every key the summary must not keep that can hold text
+// carries MARK; the id does not.
+export const LIST_CREATED = '2026-09-08T13:48:43.781123Z';
+export const LIST_UPDATED = '2026-09-08T13:49:43.781456Z';
+
+export function listItem(id: string, fields: Json = {}): Json {
+  return {
+    id,
+    title: `${MARK} list title`,
+    create_time: LIST_CREATED,
+    update_time: LIST_UPDATED,
+    mapping: null,
+    current_node: `${MARK}-current-node`,
+    conversation_template_id: null,
+    gizmo_id: null,
+    is_archived: false,
+    is_starred: null,
+    is_unread: false,
+    workspace_id: `${MARK}-workspace`,
+    async_status: null,
+    safe_urls: [`https://${MARK}.example/safe`],
+    blocked_urls: [`https://${MARK}.example/blocked`],
+    conversation_origin: null,
+    snippet: null,
+    sugar_item_id: `${MARK}-sugar-item`,
+    pinned_time: null,
+    is_temporary_chat: false,
+    is_do_not_remember: false,
+    memory_scope: 'global_enabled',
+    context_scopes: [{ type: 'project', title: `${MARK} scope` }],
+    summary_metadata: { summary: `${MARK} summary` },
+    ...fields,
+  };
+}
+
+// The project the fixtures' sidebar names, and an item of its list: it also
+// carries its project's ids, a text snippet and its owner, and a null
+// is_temporary_chat, as all 19 project items of the capture did.
+export const PROJECT_ID = 'g-p-0000000000000000000000000000aaaa';
+
+export function projectItem(id: string, fields: Json = {}): Json {
+  return listItem(id, {
+    gizmo_id: `g-p-${MARK}gizmo`,
+    conversation_template_id: `g-p-${MARK}template`,
+    is_temporary_chat: null,
+    snippet: `${MARK} snippet of the chat`,
+    owner: { user_email: `${MARK}@example.com`, name: `${MARK} owner`, user_id: `user-${MARK}`, avatar_url: `https://${MARK}.example/avatar` },
+    ...fields,
+  });
 }
