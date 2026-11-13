@@ -147,6 +147,27 @@ test('a detail memo reads back as written, and clearing it writes null', async (
   assert.deepEqual(await store.memo.get(OTHER_CHAT), { value: null, unanswered: false, malformed: true });
 });
 
+test('the back-off reads back as written, clearing it writes null, and anything else stored there reads as absent and malformed', async () => {
+  const core = rexCore();
+  const store = createStore(core.handleMessage, { log: quiet });
+  assert.deepEqual(await store.backoff.get(), { value: null, unanswered: false, malformed: false });
+  const state = { until: 1700000300000, failures: 2, code: 'rate-limited' as const };
+  assert.deepEqual(await store.backoff.set(state), { ok: true, unanswered: false });
+  assert.deepEqual(core.values.get('rex-spider-chatgpt-backoff'), state);
+  assert.deepEqual(await store.backoff.get(), { value: state, unanswered: false, malformed: false });
+  await store.backoff.set(null);
+  assert.equal(core.values.get('rex-spider-chatgpt-backoff'), null);
+  assert.deepEqual(await store.backoff.get(), { value: null, unanswered: false, malformed: false });
+  core.values.set('rex-spider-chatgpt-backoff', { until: 1, failures: 0, code: 'rate-limited' });
+  assert.deepEqual(await store.backoff.get(), { value: null, unanswered: false, malformed: true });
+});
+
+test('a back-off that gets no answer is flagged, and counts as none', { timeout: 2000 }, async () => {
+  const store = createStore(rexCore({ open: false }).handleMessage, { deadlineMs: 50, log: quiet });
+  assert.deepEqual(await store.backoff.get(), { value: null, unanswered: true, malformed: false });
+  assert.deepEqual(await store.backoff.set(null), { ok: false, unanswered: true });
+});
+
 test('log lines name a key\'s kind, never the chat id in it', { timeout: 2000 }, async () => {
   const lines: string[] = [];
   const store = createStore(rexCore({ open: false }).handleMessage, { deadlineMs: 20, log: (line) => lines.push(line) });

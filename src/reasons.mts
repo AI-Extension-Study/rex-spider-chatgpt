@@ -1,8 +1,8 @@
 // The closed set of completion reasons, and the only way to build one. A
 // reason is '<code> key=value ...': the code and the keys come from the
-// catalogue, and every value is a count or a member of a fixed set. No field
-// takes a free string, so a URL, an id, a token or a body from the site
-// cannot reach the completion event.
+// catalogue, and every value is a count, a member of a fixed set or an ISO
+// time. No field takes a free string, so a URL, an id, a token or a body from
+// the site cannot reach the completion event.
 //
 // ok and partial are the passes that read the list: the whole of it, or only
 // part (a list that failed or was cut). seen is the chats listed in the
@@ -12,6 +12,8 @@
 // left is how many due chats a later pass sends. Only ok comes with a count
 // of 0 or more and the chats' ids: partial, like every other code, comes
 // with -1 and no ids, since a list read in part would read as chats deleted.
+// backoff is a pass skipped with no request at all.
+import { BACKOFF_CODES } from './backoff.mts';
 
 // Why the sending of a pass that read the list ended early. budget: the
 // detail reads spent the pass's reading time; mode: summarize was served
@@ -24,7 +26,8 @@ export const STOPS = ['budget', 'mode', 'disabled', 'rate-limited', 'challenge',
 
 type FieldSpec =
   | { readonly kind: 'count'; readonly optional?: true }
-  | { readonly kind: 'enum'; readonly values: readonly string[]; readonly optional?: true };
+  | { readonly kind: 'enum'; readonly values: readonly string[]; readonly optional?: true }
+  | { readonly kind: 'time'; readonly optional?: true };
 
 const count = { kind: 'count' } as const;
 const optionalCount = { kind: 'count', optional: true } as const;
@@ -70,6 +73,8 @@ export const CATALOGUE = {
   store: { ms: count },
   // A throw nothing expected, before the list was read.
   internal: { stage: { kind: 'enum', values: ['start', 'home', 'list'] }, ms: count },
+  // Skipped: the back-off a refusal set runs until this time (backoff.mts).
+  backoff: { until: { kind: 'time' }, code: { kind: 'enum', values: BACKOFF_CODES } },
 } as const satisfies Record<string, Record<string, FieldSpec>>;
 
 type Catalogue = typeof CATALOGUE;
@@ -77,7 +82,8 @@ export type ReasonCode = keyof Catalogue;
 export const REASON_CODES = Object.keys(CATALOGUE) as readonly ReasonCode[];
 export type Stop = (typeof STOPS)[number];
 
-type ValueOf<S> = S extends { kind: 'count' } ? number : S extends { kind: 'enum'; values: readonly (infer V)[] } ? V : never;
+// A time goes in as epoch ms or a Date and comes out as its ISO instant.
+type ValueOf<S> = S extends { kind: 'count' } ? number : S extends { kind: 'time' } ? number | Date : S extends { kind: 'enum'; values: readonly (infer V)[] } ? V : never;
 type OptionalKey<F> = { [K in keyof F]: F[K] extends { optional: true } ? K : never }[keyof F];
 export type ReasonFields<C extends ReasonCode> =
   { [K in Exclude<keyof Catalogue[C], OptionalKey<Catalogue[C]>>]: ValueOf<Catalogue[C][K]> } &
@@ -92,6 +98,11 @@ function render(code: string, key: string, spec: FieldSpec, value: unknown): str
   if (spec.kind === 'count') {
     if (!Number.isSafeInteger(value) || (value as number) < 0) fail(code, key, 'expected a whole number of at least 0');
     return String(value);
+  }
+  if (spec.kind === 'time') {
+    const time = value instanceof Date ? value : typeof value === 'number' ? new Date(value) : null;
+    if (time === null || Number.isNaN(time.getTime())) fail(code, key, 'expected a Date or epoch milliseconds');
+    return time.toISOString();
   }
   if (typeof value !== 'string' || !spec.values.includes(value)) fail(code, key, `expected one of ${spec.values.join(', ')}`);
   return value;
