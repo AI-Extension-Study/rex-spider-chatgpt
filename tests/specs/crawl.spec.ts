@@ -118,6 +118,12 @@ async function storedValue(serviceWorker, key: string) {
   }), key)
 }
 
+async function storeValue(serviceWorker, key: string, value: unknown) {
+  return serviceWorker.evaluate(({ key, value }) => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'storeValue', key, value }, null, resolve)
+  }), { key, value })
+}
+
 // The upload key rex-spider builds for an id and a list time, from its own
 // fetchUploadKey (private in its types, a method at run time), the time read
 // as the spider before this rewrite read it on each list path: the list's
@@ -382,5 +388,53 @@ test('served halt_on_error false, a refused read sends its summary and the reads
   expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(3)} 403`])
   expect(sentIn(second)).toEqual([[chat(3), 'summary']])
   expect(completions(second.events)).toEqual([[1, [chat(3), chat(1), chat(2), chat(4)], reason('ok seen=4 dispatched=1 failed=1 left=2 stop=halt-on-error')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// A 429 that names a wait. The pass stops, and the wait is stored in
+// rex-core, so it outlives the worker: as long as the header asks, and never
+// shorter than the 5 minutes the schedule starts at.
+test('a 429 with Retry-After on a detail stops the pass and stores the wait; a crawl during it makes no request, and the one after it reads the chats left', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const now = Date.now()
+  const site = new Site()
+  for (const n of [1, 2, 3]) {
+    site.main.push(mainItem(chat(n), now - n * HOUR_MS))
+    site.details.set(chat(n), simpleDetail(chat(n)))
+  }
+  site.refusals.set(chat(2), [{ status: 429, headers: { 'retry-after': '900' }, body: JSON.stringify({ detail: 'Too many requests' }) }])
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker)
+
+  const before = Date.now()
+  const first = await crawl(serviceWorker)
+  const after = Date.now()
+  expect(site.calls.splice(0)).toEqual([...listWalk(), `GET detail ${chat(1)}`, `GET detail ${chat(2)} 429`])
+  // The refused chat gets nothing: no summary in its place and no memo.
+  expect(records(first.events).map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), false]])
+  expect(completions(first.events)).toEqual([[1, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=1 left=2 stop=rate-limited')]])
+  expect(await storedValue(serviceWorker, `rex-spider-chatgpt-detail-memo-${chat(2)}`)).toBeNull()
+  const backoff = await storedValue(serviceWorker, 'rex-spider-chatgpt-backoff')
+  expect([backoff.code, backoff.failures]).toEqual(['rate-limited', 1])
+  // 900 s from the refusal, which came between the two readings of the clock.
+  expect(backoff.until).toBeGreaterThanOrEqual(before + 900_000)
+  expect(backoff.until).toBeLessThanOrEqual(after + 900_000)
+
+  const during = await crawl(serviceWorker)
+  expect(site.calls).toEqual([])
+  const skipped = `backoff until=${new Date(backoff.until).toISOString()} code=rate-limited`
+  expect(records(during.events)).toEqual([])
+  expect(completions(during.events)).toEqual([[-1, [], skipped]])
+  expect(during.result).toEqual({ sitesCrawled: ['chatgpt'], issues: [{ url: 'https://chatgpt.com/', message: skipped }] })
+
+  // The wait runs out.
+  await storeValue(serviceWorker, 'rex-spider-chatgpt-backoff', { ...backoff, until: Date.now() - 1000 })
+  const resumed = await crawl(serviceWorker)
+  expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(2)}`, `GET detail ${chat(3)}`])
+  expect(records(resumed.events).map((record) => [record.identifier, record.is_summary])).toEqual([[chat(2), false], [chat(3), false]])
+  expect(completions(resumed.events)).toEqual([[2, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=2')]])
+  // A crawl that read the lists with no refusal clears it.
+  expect(await storedValue(serviceWorker, 'rex-spider-chatgpt-backoff')).toBeNull()
   await expectAllRouted(serviceWorker, site, unrouted)
 })
