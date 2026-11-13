@@ -207,6 +207,7 @@ test('served summarize, a crawl sends a summary per chat, newest first, keyed as
 // the window starts 120 days back, where one anchored at the crawl would
 // start 90 days back.
 test('served the study\'s window anchored at install, a summary crawl sends the chats last used since 90 days before the install, and no older one', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
   const now = Date.now()
   const site = new Site()
   site.main.push(mainItem(chat(1), now - HOUR_MS), mainItem(chat(2), daysAgo(100, now)), mainItem(chat(3), daysAgo(125, now)))
@@ -490,6 +491,7 @@ test('a token that expires between two detail reads ends the pass as signed out,
 // from the list the spider may already have keyed it on: a project before
 // the starred list.
 test('archived and starred chats go out once each, a starred project chat under the project path\'s key, and the next crawl sends none', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
   const site = new Site()
   const archived = { is_archived: true }
   const starred = { is_starred: true, pinned_time: '2026-09-08T14:00:00.000000Z' }

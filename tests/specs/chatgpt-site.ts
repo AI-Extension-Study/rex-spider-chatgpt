@@ -21,7 +21,6 @@ export const ROUTE_HEADER = 'x-spec-route'
 export const ROUTE_NAME = 'chatgpt'
 
 const PAGE = 28
-const API = '/backend-api'
 
 // The requests a pass makes, as the spider writes them, and how a call is
 // written down. The main list's query is the one the spider has always sent;
