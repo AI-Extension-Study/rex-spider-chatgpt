@@ -162,15 +162,31 @@ const sidebarUrl = (cursor: string | null) => (cursor === null ? SIDEBAR : curso
 const projectUrl = (projectId: string, cursor: string) => cursorUrl(`${API}/gizmos/${encodeURIComponent(projectId)}/conversations`, cursor);
 
 // An ISO 8601 instant: a date, a time, and Z or an offset. The capture's are
-// like "2026-09-08T13:48:43.781123Z". It is checked by shape, and not by
-// Date.parse, which reads almost any string with a number in it ("TITLE-2" is
-// February 2001), because DateString logs the value it cannot read and these
-// fields are not ours to log.
+// like "2026-09-08T13:48:43.781123Z". It is checked by shape, then by
+// Temporal, before DateString reads it, because DateString logs the value it
+// cannot read and these fields are not ours to log. Date.parse is no check:
+// it reads almost any string with a number in it ("TITLE-2" is February
+// 2001).
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)$/;
+
+// Temporal.Instant, taken from a DateString's value so it is the copy
+// DateString reads with. Its from() throws on a string of the right shape
+// that names no instant (a 13th month, 30 February, hour 24, offset +25:00),
+// where DateString would print the string.
+const INSTANT = (new DateString('1970-01-01T00:00:00Z').value as object).constructor as unknown as { from(item: string): unknown };
+
+function namesInstant(value: string): boolean {
+  try {
+    INSTANT.from(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // A string read as an instant, or null.
 function instant(value: unknown): DateString | null {
-  if (typeof value !== 'string' || !ISO_INSTANT.test(value)) {
+  if (typeof value !== 'string' || !ISO_INSTANT.test(value) || !namesInstant(value)) {
     return null;
   }
   const read = new DateString(value);
