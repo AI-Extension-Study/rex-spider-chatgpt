@@ -52,8 +52,8 @@ export class Site {
   projects = new Map()
   // Chat id to its detail.
   details = new Map()
-  // Chat id to answers its detail reads get before the detail itself, one a
-  // read: { status, headers, body }.
+  // Chat id to the answers its next detail reads get in place of the detail,
+  // one per read: { status, headers, body }.
   refusals = new Map()
   // Awaited before a detail read is answered, with the chat id.
   beforeDetail = async () => {}

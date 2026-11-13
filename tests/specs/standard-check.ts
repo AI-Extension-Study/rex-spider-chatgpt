@@ -59,7 +59,7 @@ function checkTurns(turns, complete, problems) {
     } else if (turn.speaker === 'assistant') {
       if (!sameKeys(turn, ASSISTANT_TURN)) problems.push(`${where}: an assistant turn's keys are not the standard ones in order, then content_type, status, model_slug and nodes`)
       if (!(Number.isSafeInteger(turn.nodes) && turn.nodes > 0)) problems.push(`${where}: nodes is not a positive count`)
-      if (turn.model_slug !== null && !TYPE_NAME.test(turn.model_slug ?? '') && turn.model_slug !== 'unrecognised') problems.push(`${where}: model_slug is not a type name or null`)
+      if (turn.model_slug !== null && !TYPE_NAME.test(turn.model_slug ?? '')) problems.push(`${where}: model_slug is not a type name or null`)
     } else {
       problems.push(`${where}: speaker is not user or assistant`)
     }
