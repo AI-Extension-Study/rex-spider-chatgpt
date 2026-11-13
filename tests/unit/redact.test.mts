@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -400,4 +401,14 @@ test('2,000 single-field departures from records the builders make: none throws,
   // Both ways out were taken, so the departures reached the record checks and the field forms alike.
   assert.ok(outcomes.kept > 500 && outcomes.cut > 100, JSON.stringify(outcomes));
   t.diagnostic(`${outcomes.kept} kept as records, ${outcomes.cut} cut to the scaffold`);
+});
+
+test('the redactor imports nothing but rex-types, so the extension can carry a copy of it', () => {
+  const imports = (file: string) => {
+    const source = readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8');
+    assert.equal(/\bimport\s*\(|\brequire\s*\(/.test(source), false, `${file} loads a module at run time`);
+    return [...source.matchAll(/^import\b[^;]*?from\s+'([^']+)';/gm)].map((match) => match[1]);
+  };
+  assert.deepEqual(imports('keep.mts'), ['@bric/rex-types/types']);
+  assert.deepEqual(imports('redact.mts'), ['@bric/rex-types/types', './keep.mts']);
 });
