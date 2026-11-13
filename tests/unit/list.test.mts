@@ -419,8 +419,7 @@ test('meta holds the nine allow-listed list keys, each as the list sent it when 
 });
 
 test('a meta value not in its form is null: booleans, is_starred true only, times by the ISO shape', async (t) => {
-  // DateString prints a time of the right shape that it cannot read, which is
-  // digits and punctuation only; keep it out of the test output, and check it.
+  // Anything printed is kept out of the test output and checked for markers.
   const printed: string[] = [];
   t.mock.method(console, 'log', (...args: unknown[]) => {
     printed.push(args.map(String).join(' '));
@@ -627,6 +626,28 @@ test('a chat whose create_time cannot be read is still listed, with started null
   for (const line of [...printed, ...fake.logs, ...other.logs]) {
     assert.ok(!line.includes('SECRET'), `"${line}" shows a create_time`);
   }
+});
+
+test('a list time of the ISO shape that names no instant reads as none, on every path, and is never logged', async (t) => {
+  // DateString logs a value it cannot read, and these fields are not ours to log.
+  const printed: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => {
+    printed.push(args.map(String).join(' '));
+  });
+  const impossible = ['2026-13-08T13:48:43Z', '2026-02-30T13:48:43Z', '2026-09-08T24:00:00Z', '2026-09-08T13:48:43+25:00'];
+  const fake = run({
+    ...NOTHING,
+    [MAIN(0)]: page([...impossible.map((time, k) => ({ ...entry(k + 1), create_time: time, pinned_time: time })), { ...entry(5), update_time: impossible[0] }]),
+    [MAIN(28)]: empty(),
+    [SIDEBAR]: json(sidebarOf(P1)),
+    [PROJECT(P1, '0')]: projectPage([{ ...projectEntry(6), create_time: impossible[0] }], null),
+  });
+  const result = await fake.result;
+  assert.deepEqual(ids(result.items), [chatId(1), chatId(2), chatId(3), chatId(4), chatId(6)]);
+  assert.deepEqual(result.items.map((item) => [item.started, item.meta.create_time]), result.items.map(() => [null, null]));
+  assert.deepEqual(result.items.slice(0, 4).map((item) => item.meta.pinned_time), [null, null, null, null]);
+  assert.equal(result.reason, '1 item with an unreadable update_time');
+  assert.deepEqual(printed, []);
 });
 
 test('uploadTime of a main, archived or starred chat is new DateString(update_time), from the ISO string', async () => {
