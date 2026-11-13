@@ -285,6 +285,26 @@ export function reasoningDetail(): Json {
   ), nodeId(7));
 }
 
+// Nodes of forms the capture never showed, each read as null or in its form
+// by the skeleton: a null node, a 0 and a string for a node, a node with no
+// id, links or readable message, an author that is a string or null,
+// metadata that is a string, a list or null, children null, a message that
+// is true. Four keys are `key(n)`: n2 to n5 by default, which the id rule
+// does not take.
+export function oddTree(key: (n: number) => string = (n) => `n${n}`): Json {
+  return {
+    [ROOT]: { id: ROOT, message: null, parent: null, children: [nodeId(1), nodeId(7)] },
+    [nodeId(1)]: { id: nodeId(1), message: { author: 'user', content: 'x', metadata: 'meta', create_time: 0, status: '' }, parent: ROOT, children: [] },
+    [key(2)]: null,
+    [key(3)]: 0,
+    [key(4)]: `${MARK} a node`,
+    [key(5)]: { message: 7 },
+    [nodeId(7)]: { id: nodeId(7), parent: ROOT, children: [], message: { author: { role: 'tool', name: 'web.run' }, weight: 0, end_turn: false, recipient: '', channel: '', content: null, metadata: [] } },
+    [nodeId(8)]: { id: nodeId(8), parent: null, children: null, message: { author: null, metadata: null } },
+    [nodeId(9)]: { id: nodeId(9), parent: nodeId(8), children: [], message: true },
+  };
+}
+
 // List items as the conversation lists send them, times as ISO strings with
 // microseconds. Every key the summary must not keep that can hold text
 // carries MARK; the id does not.

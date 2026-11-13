@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { parseDetail } from '../../src/detail.mts';
 import { skeletonOf } from '../../src/skeleton.mts';
 import {
-  MARK, ROOT, type Spec, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, nodeId, nodeOf, prompt,
+  MARK, ROOT, type Spec, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, nodeId, nodeOf, oddTree, prompt,
   reasoningDetail, recap, searchCall, systemMessage, thinking, toolResult, tree,
 } from './fixtures.mts';
 
@@ -640,17 +640,7 @@ test('a node\'s id, parent and children reach the skeleton only as node ids: a U
 });
 
 test('the skeleton writes a value out of its form as null, or a type name out of its form as unrecognised', () => {
-  const odd: Json = {
-    [ROOT]: { id: ROOT, message: null, parent: null, children: [nodeId(1), nodeId(7)] },
-    [nodeId(1)]: { id: nodeId(1), message: { author: 'user', content: 'x', metadata: 'meta', create_time: 0, status: '' }, parent: ROOT, children: [] },
-    n2: null,
-    n3: 0,
-    n4: `${MARK} a node`,
-    n5: { message: 7 },
-    [nodeId(7)]: { id: nodeId(7), parent: ROOT, children: [], message: { author: { role: 'tool', name: 'web.run' }, weight: 0, end_turn: false, recipient: '', channel: '', content: null, metadata: [] } },
-    [nodeId(8)]: { id: nodeId(8), parent: null, children: null, message: { author: null, metadata: null } },
-    [nodeId(9)]: { id: nodeId(9), parent: nodeId(8), children: [], message: true },
-  };
+  const odd = oddTree();
   const none = { create_time: null, update_time: null, status: null, weight: null, end_turn: null, recipient: null, channel: null, content_type: null, metadata: {} };
   assert.deepEqual(parse({ mapping: odd }).skeleton, {
     [ROOT]: { id: ROOT, parent: null, children: [nodeId(1), nodeId(7)], message: null },
