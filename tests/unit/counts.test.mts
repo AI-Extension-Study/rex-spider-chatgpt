@@ -70,6 +70,23 @@ test('a Deep Research report, drawn beside the chat from metadata.chatgpt_sdk.wi
   assert.deepEqual([withText.text_chars, withText.text_words], [14, 3]);
 });
 
+test('with widget_state a string, a part that is empty or the tool call that made the report counts none, and the other parts count', () => {
+  const report = JSON.stringify({ report_message: { content: { parts: [`${MARK} a long report of many words`] } } });
+  // 25 code points and 2 words when counted as text.
+  const toolCall = `{"path": "/${MARK}/start"}`;
+  const visible = `${MARK} visible words here`; // 25 code points, 4 words
+  const withWidget = (parts: unknown[], widgetState: unknown) => answer(nodeId(4), T0, '', { parts, metadata: { chatgpt_sdk: { widget_state: widgetState } } });
+  const count = (message: Json) => [alone(message).text_chars, alone(message).text_words];
+  assert.deepEqual(count(withWidget([toolCall], report)), [0, 0]);
+  assert.deepEqual(count(withWidget([''], report)), [0, 0]);
+  assert.deepEqual(count(withWidget([visible, toolCall, ''], report)), [25, 4]);
+  assert.deepEqual(count(withWidget([visible], '{}')), [25, 4]);
+  // A widget_state that is null, false or absent changes nothing: every part counts.
+  for (const state of [null, false, undefined]) {
+    assert.deepEqual(count(withWidget([toolCall, visible], state)), [50, 6], String(state));
+  }
+});
+
 test('code and execution output are not text, and add nothing', () => {
   const code = { ...answer(nodeId(4), T0, ''), content: { content_type: 'code', language: 'python', text: `print("${MARK}")` } };
   const output = { ...answer(nodeId(5), T0, ''), content: { content_type: 'execution_output', text: `${MARK} output` } };
@@ -167,6 +184,20 @@ test('search results: a result is one url and ref_id, so one URL under two ref_i
   const results = toolResult(nodeId(6), T0 + 1, [{ type: 'search_result_group', domain: `${MARK}.example`, entries: [at(0), at(1), at(0)] }]);
   const last = answer(nodeId(9), T0 + 2, ONE_TWO);
   assert.equal(replyCounts([last], [searchCall(nodeId(5), T0), results, last]).search_result_count, 2);
+});
+
+test('search results: an entry with neither url nor ref_id cannot be told from another, so the count is null', () => {
+  const bare = { type: 'search_result', title: `${MARK} title`, snippet: `${MARK} snippet`, pub_date: null, attribution: `${MARK}.example` };
+  const call = searchCall(nodeId(5), T0);
+  const last = answer(nodeId(9), T0 + 2, ONE_TWO);
+  const results = (entries: unknown[]) => toolResult(nodeId(6), T0 + 1, [{ type: 'search_result_group', domain: `${MARK}.example`, entries }]);
+  assert.equal(replyCounts([last], [call, results([bare, bare, bare]), last]).search_result_count, null);
+  assert.equal(replyCounts([last], [call, results([{ ...bare, url: null, ref_id: null }]), last]).search_result_count, null);
+  const lastWithBare = answer(nodeId(9), T0 + 2, ONE_TWO, { groups: [{ type: 'search_result_group', entries: [bare] }] });
+  assert.equal(replyCounts([lastWithBare], [call, lastWithBare]).search_result_count, null);
+  // One of the two is enough to tell entries apart.
+  assert.equal(replyCounts([last], [call, results([{ ...bare, url: `https://${MARK}.example/a` }, { ...bare, url: `https://${MARK}.example/b` }]), last]).search_result_count, 2);
+  assert.equal(replyCounts([last], [call, results([{ ...bare, ref_id: { turn_index: 0, ref_type: 'search', ref_index: 1 } }]), last]).search_result_count, 1);
 });
 
 test('search results: with none on a tool message, the distinct results on the folded messages', () => {

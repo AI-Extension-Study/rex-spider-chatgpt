@@ -94,13 +94,25 @@ export function answer(id: string, time: number, text: string, options: AnswerOp
   });
 }
 
-// A reasoning model's thinking (in_progress on 6 of 17 in the capture).
+// A reasoning model's thinking (in_progress on 6 of 17 in the capture), with
+// the timing keys the skeleton keeps.
 export function thinking(id: string, time: number): Json {
   return message(id, 'assistant', {
     content_type: 'thoughts',
     thoughts: [{ summary: `${MARK} thought summary`, content: `${MARK} thought content`, chunks: [], finished: true }],
     source_analysis_msg_id: 'dddddddd-0000-4000-8000-000000000001',
-  }, { time, status: 'in_progress', metadata: { reasoning_title: `${MARK} reasoning title`, reasoning_status: 'is_reasoning' } });
+  }, {
+    time,
+    status: 'in_progress',
+    metadata: {
+      reasoning_title: `${MARK} reasoning title`,
+      reasoning_status: 'is_reasoning',
+      reasoning_start_time: time - 0.5,
+      reasoning_end_time: time + 0.25,
+      thinking_effort: 'high',
+      working_turn_id: 'dddddddd-0000-4000-8000-000000000002',
+    },
+  });
 }
 
 // The recap before a reasoning model's final answer.
@@ -128,8 +140,8 @@ export function toolResult(id: string, time: number, groups: unknown[] | undefin
   });
 }
 
-export function systemMessage(id: string): Json {
-  return message(id, 'system', { content_type: 'text', parts: [''] }, { time: null, metadata: { is_visually_hidden_from_conversation: true } });
+export function systemMessage(id: string, hidden = true): Json {
+  return message(id, 'system', { content_type: 'text', parts: [''] }, { time: null, metadata: hidden ? { is_visually_hidden_from_conversation: true } : {} });
 }
 
 // The custom instructions, a hidden user message.
@@ -237,6 +249,18 @@ export function detail(mapping: Json, current: string | undefined, fields: Json 
     owner: { user_email: `${MARK}@example.com`, name: `${MARK} owner` },
     ...fields,
   };
+}
+
+// The capture's edited prompts: both were the first prompt, so the old and
+// the new prompt hang from the root side by side, each with its reply.
+export function editedFirstPromptDetail(): Json {
+  return detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1, `${MARK} before the edit`)],
+    [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} old answer`)],
+    [nodeId(3), ROOT, prompt(nodeId(3), T0 + 3, `${MARK} after the edit`)],
+    [nodeId(4), nodeId(3), answer(nodeId(4), T0 + 4, `${MARK} new answer`)],
+  ), nodeId(4));
 }
 
 // A prompt and a reasoning model's reply in the order the capture saw:

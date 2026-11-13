@@ -41,17 +41,15 @@ function metadataOf(message: unknown): Readonly<Record<string, unknown>> | null 
 // The text of one message: its string parts, and a voice part's transcript.
 // Images, files and audio are not text. A Deep Research report is a document
 // drawn beside the chat from metadata.chatgpt_sdk.widget_state, which is
-// never read; its message's own parts hold no text a person reads there (the
-// tool call that made the report, or nothing), so it counts none.
+// never read. When widget_state is a string, a part that is empty or is the
+// tool call that made the report (it starts {"path") is no text a person
+// reads, and counts none; the message's other parts count as usual.
 function textOf(message: unknown): Text | null {
   const metadata = metadataOf(message);
   if (metadata === null) {
     return null;
   }
-  const widget = field(field(metadata, 'chatgpt_sdk'), 'widget_state');
-  if (widget !== undefined && widget !== null) {
-    return NO_TEXT;
-  }
+  const report = typeof field(field(metadata, 'chatgpt_sdk'), 'widget_state') === 'string';
   const content = field(message, 'content');
   const type = field(content, 'content_type');
   if (typeof type !== 'string') {
@@ -67,6 +65,9 @@ function textOf(message: unknown): Text | null {
   let chars = 0;
   let words = 0;
   for (const part of parts) {
+    if (report && typeof part === 'string' && (part === '' || part.startsWith('{"path"'))) {
+      continue;
+    }
     let text: unknown = part;
     if (isObject(part)) {
       if (field(part, 'content_type') !== 'audio_transcription') {
@@ -139,8 +140,10 @@ const SEARCH_TOOLS: ReadonlySet<string> = new Set(['web', 'web.run', 'browser'])
 const isSearchCall = (recipient: unknown): boolean => typeof recipient === 'string' && (SEARCH_TOOLS.has(recipient) || recipient.startsWith('web.') || recipient.startsWith('browser.'));
 
 // Adds a message's search results to `into`, each once by url and ref_id;
-// false when its search_result_groups, a group or an entry has another form.
-// The inline copy under inline_cot_expandable_content is never read.
+// false when its search_result_groups, a group or an entry has another form,
+// or an entry has neither url nor ref_id, which leaves it nothing to be told
+// apart from another by. The inline copy under inline_cot_expandable_content
+// is never read.
 function addResults(message: unknown, into: Set<string>): boolean {
   const metadata = metadataOf(message);
   if (metadata === null) {
@@ -159,10 +162,12 @@ function addResults(message: unknown, into: Set<string>): boolean {
       return false;
     }
     for (const entry of entries) {
-      if (!isObject(entry)) {
+      const url = field(entry, 'url') ?? null;
+      const refId = field(entry, 'ref_id') ?? null;
+      if (!isObject(entry) || (url === null && refId === null)) {
         return false;
       }
-      into.add(JSON.stringify([field(entry, 'url') ?? null, field(entry, 'ref_id') ?? null]));
+      into.add(JSON.stringify([url, refId]));
     }
   }
   return true;

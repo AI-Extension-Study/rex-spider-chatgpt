@@ -16,7 +16,7 @@
 // it held. Either, or a part of the tree that hangs from no root (its parent
 // links loop), leaves the turns incomplete.
 import { type Counts, promptCounts, replyCounts } from './counts.mts';
-import { field, instantOf, isObject, typeName } from './forms.mts';
+import { field, instantOf, isObject, statusOf, typeName } from './forms.mts';
 import { skeletonOf } from './skeleton.mts';
 
 // At most this many turns, the newest kept, and their JSON at most this many
@@ -83,9 +83,6 @@ interface TreeNode {
   readonly message: Message | null;
   readonly kind: 'prompt' | 'reply' | 'other';
 }
-
-const STATUSES: ReadonlySet<string> = new Set(['finished_successfully', 'in_progress']);
-const statusOf = (value: unknown): string | null => (typeof value !== 'string' ? null : STATUSES.has(value) ? value : 'unrecognised');
 
 // What a message is to the turns, or null when that cannot be told: a role
 // that is not a string, metadata of another form, or a message to all whose
@@ -193,6 +190,21 @@ function currentBranch(nodes: ReadonlyMap<string, TreeNode | null>, current: unk
   return path;
 }
 
+// The links between `stop` and `link`, as a path of their own whose top has
+// nothing above it: what lies between a reply's last message and the node
+// where the tree branches, which is on every branch's path.
+function after(link: Link | null, stop: Link): Link | null {
+  const between: TreeNode[] = [];
+  for (let at = link; at !== null && at !== stop; at = at.up) {
+    between.push(at.node);
+  }
+  let path: Link | null = null;
+  for (let at = between.length - 1; at >= 0; at -= 1) {
+    path = { node: between[at], up: path };
+  }
+  return path;
+}
+
 function pathOf(link: Link): unknown[] {
   const path: unknown[] = [];
   for (let at: Link | null = link; at !== null; at = at.up) {
@@ -262,7 +274,9 @@ export function parseDetail(json: unknown): Detail {
 
   // Depth first, so every turn is made after the turns above it. A reply ends
   // where the tree branches below it, so no message is in two turns and a
-  // turn's identifier is above everything that hangs from it.
+  // turn's identifier is above everything that hangs from it. The messages
+  // between its last folded message and the branch, a search call say, are on
+  // each branch's path.
   const made: Array<Prompt | Reply> = [];
   const stack = [...starts].reverse();
   let walked = 0;
@@ -287,7 +301,9 @@ export function parseDetail(json: unknown): Detail {
       next = { above, open, up: link };
     }
     const children = below.get(node.id) ?? [];
-    const shared = children.length > 1 && next.open !== null ? { above: next.above, open: null, up: null } : next;
+    const shared = children.length > 1 && next.open !== null
+      ? { above: next.above, open: null, up: after(next.up, next.open.links[next.open.links.length - 1]) }
+      : next;
     for (let at = children.length - 1; at >= 0; at -= 1) {
       stack.push({ node: children[at], ...shared });
     }

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { parseDetail } from '../../src/detail.mts';
+import { skeletonOf } from '../../src/skeleton.mts';
 import {
-  MARK, ROOT, type Spec, T0, answer, attachment, detail, group, hiddenContext, imagePart, nodeId, nodeOf, prompt, reasoningDetail, recap,
-  searchCall, systemMessage, thinking, toolResult, tree,
+  MARK, ROOT, type Spec, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, nodeId, nodeOf, prompt,
+  reasoningDetail, recap, searchCall, systemMessage, thinking, toolResult, tree,
 } from './fixtures.mts';
 
 type Json = Record<string, unknown>;
@@ -338,6 +339,74 @@ test('a reply counts the searches on its own path only, not an earlier reply\'s'
   assert.deepEqual(parsed.turns.map((turn) => turn.search_result_count), [0, 2, 0, 0]);
 });
 
+test('a reply that branches at a search call: the call is on each branch\'s path, so with no results stored each reads null', () => {
+  const below = (...specs: Spec[]) => parse(detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)],
+    [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} before the search`, { channel: null })],
+    [nodeId(3), nodeId(2), searchCall(nodeId(3), T0 + 3, 'web')],
+    ...specs,
+  ), nodeId(5))).turns.map((turn) => [turn.identifier, turn.parent, turn.search_result_count]);
+  // The call itself branches, and no tool message holds its results.
+  assert.deepEqual(below(
+    [nodeId(4), nodeId(3), answer(nodeId(4), T0 + 4, `${MARK} first branch`)],
+    [nodeId(5), nodeId(3), answer(nodeId(5), T0 + 5, `${MARK} second branch`)],
+  ), [[nodeId(1), null, 0], [nodeId(2), nodeId(1), 0], [nodeId(4), nodeId(2), null], [nodeId(5), nodeId(2), null]]);
+  // The branch is below its tool message: both branches count its results.
+  assert.deepEqual(below(
+    [nodeId(6), nodeId(3), toolResult(nodeId(6), T0 + 3.5, [group('news', 0, 2)])],
+    [nodeId(4), nodeId(6), answer(nodeId(4), T0 + 4, `${MARK} first branch`)],
+    [nodeId(5), nodeId(6), answer(nodeId(5), T0 + 5, `${MARK} second branch`)],
+  ), [[nodeId(1), null, 0], [nodeId(2), nodeId(1), 0], [nodeId(4), nodeId(2), 2], [nodeId(5), nodeId(2), 2]]);
+  // A search before the reply's last message is the reply's, not its branches'.
+  const branchedAtTheAnswer = parse(detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)],
+    [nodeId(2), nodeId(1), searchCall(nodeId(2), T0 + 2)],
+    [nodeId(3), nodeId(2), toolResult(nodeId(3), T0 + 3, [group('news', 0, 2)])],
+    [nodeId(4), nodeId(3), answer(nodeId(4), T0 + 4, `${MARK} answer`)],
+    [nodeId(5), nodeId(4), answer(nodeId(5), T0 + 5, `${MARK} first branch`)],
+    [nodeId(6), nodeId(4), answer(nodeId(6), T0 + 6, `${MARK} second branch`)],
+  ), nodeId(6))).turns.map((turn) => [turn.identifier, turn.parent, turn.search_result_count]);
+  assert.deepEqual(branchedAtTheAnswer, [[nodeId(1), null, 0], [nodeId(4), nodeId(1), 2], [nodeId(5), nodeId(4), 0], [nodeId(6), nodeId(4), 0]]);
+});
+
+test('a system message shown to all is still no turn', () => {
+  const parsed = parse(detail(tree(
+    [ROOT, null, null],
+    [nodeId(10), ROOT, systemMessage(nodeId(10), false)],
+    [nodeId(1), nodeId(10), prompt(nodeId(1), T0 + 1)],
+    [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, `${MARK} answer`)],
+    [nodeId(11), nodeId(2), systemMessage(nodeId(11), false)],
+    [nodeId(3), nodeId(11), prompt(nodeId(3), T0 + 3)],
+  ), nodeId(3)));
+  assert.deepEqual(shape(parsed.turns), [[nodeId(1), null, true], [nodeId(2), nodeId(1), true], [nodeId(3), nodeId(2), true]]);
+});
+
+test('the capture\'s edited prompt: two prompts side by side under the root, both with no parent, the old one and its reply false', () => {
+  assert.deepEqual(shape(parse(editedFirstPromptDetail()).turns), [
+    [nodeId(1), null, false],
+    [nodeId(2), nodeId(1), false],
+    [nodeId(3), null, true],
+    [nodeId(4), nodeId(3), true],
+  ]);
+});
+
+test('a turn\'s content_type and a prompt\'s status are held to their forms: unrecognised for another string, null for no string', () => {
+  const turnsWith = (promptFields: Json, replyType: string) => parse(detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, { ...prompt(nodeId(1), T0 + 1), ...promptFields }],
+    [nodeId(2), nodeId(1), { ...answer(nodeId(2), T0 + 2, `${MARK} answer`), content: { content_type: replyType, parts: [`${MARK} answer`] } }],
+  ), nodeId(2))).turns;
+  const [oddPrompt, oddReply] = turnsWith({ content: { content_type: `Rich ${MARK}`, parts: [`${MARK} x`] }, status: `Cancelled ${MARK}` }, `Rich ${MARK}`);
+  assert.deepEqual([oddPrompt.content_type, oddPrompt.status, oddPrompt.text_chars], ['unrecognised', 'unrecognised', null]);
+  assert.deepEqual([oddReply.content_type, oddReply.text_chars], ['unrecognised', null]);
+  const [notStrings] = turnsWith({ content: { content_type: 7, parts: [`${MARK} x`] }, status: 7 }, 'text');
+  assert.deepEqual([notStrings.content_type, notStrings.status, notStrings.text_chars], [null, null, null]);
+  // A status that is undefined is one JSON leaves out.
+  assert.equal(turnsWith({ status: undefined }, 'text')[0].status, null);
+});
+
 test('a reply before any prompt has no parent', () => {
   const parsed = parse(detail(tree(
     [ROOT, null, null],
@@ -423,8 +492,10 @@ test('a body that holds no conversation gives no turns, incomplete, and an empty
 });
 
 // The content processor's code that built the skeleton before this module,
-// verbatim but for the function around it: the module keeps exactly what it
-// kept.
+// verbatim but for the function around it: the module keeps the same keys and,
+// for a value in its form, the same value. It is compared on fixtures whose
+// values are all in their forms: on a value out of its form the module writes
+// null or 'unrecognised', where this code copied the value as it came.
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const CHATGPT_MSG_META_KEEP = new Set([
   'model_slug', 'resolved_model_slug', 'message_type', 'finished_duration_sec',
@@ -469,27 +540,115 @@ function previousSkeleton(md: any): any {
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
-test('the skeleton keeps exactly what the content processor kept, on every fixture', () => {
-  const chats = [reasoningDetail(), fourInALine(), line(30).chat];
+test('the skeleton keeps what the content processor kept, on every fixture', () => {
+  const chats = [reasoningDetail(), fourInALine(), line(30).chat, editedFirstPromptDetail()];
   for (const chat of chats) {
     assert.deepEqual(parse(chat).skeleton, previousSkeleton(chat));
   }
 });
 
-test('the skeleton keeps exactly what the content processor kept, on nodes of odd forms', () => {
+test('values in their forms reach the skeleton unchanged', () => {
+  const { skeleton } = parse(reasoningDetail());
+  const at = (n: number) => skeleton[nodeId(n)] as Json;
+  assert.deepEqual(at(2), {
+    id: nodeId(2),
+    parent: nodeId(1),
+    children: [nodeId(3)],
+    message: {
+      author: { role: 'assistant', name: null }, create_time: T0 + 1, update_time: null, status: 'in_progress', weight: 1, end_turn: null,
+      recipient: 'all', channel: null, content_type: 'thoughts',
+      metadata: {
+        turn_exchange_id: 'bbbbbbbb-0000-4000-8000-000000000001', reasoning_start_time: T0 + 0.5, reasoning_end_time: T0 + 1.25,
+        thinking_effort: 'high', working_turn_id: 'dddddddd-0000-4000-8000-000000000002',
+      },
+    },
+  });
+  const message = (n: number) => at(n).message as Json;
+  assert.deepEqual([message(5).recipient, message(5).channel, message(5).content_type], ['web.run', 'commentary', 'text']);
+  assert.deepEqual(message(6).author, { role: 'tool', name: 'web.run' });
+  assert.deepEqual(message(7).metadata, {
+    turn_exchange_id: 'bbbbbbbb-0000-4000-8000-000000000001', model_slug: 'gpt-5-thinking', resolved_model_slug: 'gpt-5-2025', message_type: 'next',
+    request_id: 'cccccccc-0000-4000-8000-000000000001', finished_duration_sec: 3,
+  });
+  // The root, client-created-root, and the first prompt's parent.
+  assert.deepEqual([(skeleton[ROOT] as Json).id, (skeleton[ROOT] as Json).parent, at(1).parent], [ROOT, null, ROOT]);
+});
+
+test('every value of a message the skeleton copies is held to its form: text planted in any of them never reaches the parse', () => {
+  const base = () => detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)],
+    [nodeId(2), nodeId(1), thinking(nodeId(2), T0 + 2)],
+    [nodeId(3), nodeId(2), searchCall(nodeId(3), T0 + 3)],
+    [nodeId(4), nodeId(3), toolResult(nodeId(4), T0 + 4, [group('news', 0, 1)])],
+    [nodeId(5), nodeId(4), answer(nodeId(5), T0 + 5, `${MARK} answer`)],
+  ), nodeId(5));
+  const text = `${MARK} planted text`;
+  const at = (mapping: Json, n: number) => nodeOf(mapping, nodeId(n)).message as Json;
+  const KEPT = ['model_slug', 'resolved_model_slug', 'message_type', 'thinking_effort', 'finished_duration_sec', 'reasoning_start_time', 'reasoning_end_time', 'request_id', 'turn_exchange_id', 'working_turn_id'];
+  const plants: Array<[string, (mapping: Json) => void]> = [
+    ['author.role', (mapping) => ((at(mapping, 4).author as Json).role = text)],
+    ['author.name', (mapping) => ((at(mapping, 4).author as Json).name = text)],
+    ['recipient', (mapping) => (at(mapping, 3).recipient = text)],
+    ['channel', (mapping) => (at(mapping, 5).channel = text)],
+    ['status', (mapping) => (at(mapping, 5).status = text)],
+    ['content_type', (mapping) => ((at(mapping, 4).content as Json).content_type = text)],
+    ['create_time', (mapping) => (at(mapping, 4).create_time = text)],
+    ['update_time', (mapping) => (at(mapping, 4).update_time = text)],
+    ['weight', (mapping) => (at(mapping, 4).weight = text)],
+    ['end_turn', (mapping) => (at(mapping, 5).end_turn = text)],
+    ['a time that is an object', (mapping) => (at(mapping, 4).create_time = { text })],
+    ...KEPT.map((key): [string, (mapping: Json) => void] => [`metadata.${key}`, (mapping) => ((at(mapping, 5).metadata as Json)[key] = text)]),
+    // A bare word passes a looser id form; the capture saw only UUIDs here.
+    ...['request_id', 'turn_exchange_id', 'working_turn_id'].map((key): [string, (mapping: Json) => void] => [`metadata.${key} a bare word`, (mapping) => ((at(mapping, 5).metadata as Json)[key] = MARK)]),
+  ];
+  for (const [what, plant] of plants) {
+    const chat = base();
+    plant(chat.mapping as Json);
+    assert.equal(JSON.stringify(parse(chat).skeleton).includes(MARK), false, what);
+  }
+});
+
+test('a node\'s id, parent and children reach the skeleton only as node ids: a UUID, or client-created-root', () => {
+  const skeleton = skeletonOf({
+    [ROOT]: { id: ROOT, parent: null, children: [nodeId(1), nodeId(2).toUpperCase(), `${MARK} child`, 5], message: null },
+    [nodeId(1)]: { id: `${MARK} id`, parent: `${MARK} parent`, children: `${MARK} children`, message: null },
+    [nodeId(2)]: { id: MARK, parent: { text: MARK }, children: [], message: null },
+  });
+  assert.deepEqual(skeleton, {
+    [ROOT]: { id: ROOT, parent: null, children: [nodeId(1), nodeId(2).toUpperCase(), null, null], message: null },
+    [nodeId(1)]: { id: null, parent: null, children: null, message: null },
+    [nodeId(2)]: { id: null, parent: null, children: [], message: null },
+  });
+});
+
+test('the skeleton writes a value out of its form as null, or a type name out of its form as unrecognised', () => {
   const odd: Json = {
-    [ROOT]: { id: ROOT, message: null, parent: null, children: ['n1', 'n6'] },
-    n1: { id: 'n1', message: { author: 'user', content: 'x', metadata: 'meta', create_time: 0, status: '' }, parent: ROOT, children: [] },
+    [ROOT]: { id: ROOT, message: null, parent: null, children: [nodeId(1), nodeId(7)] },
+    [nodeId(1)]: { id: nodeId(1), message: { author: 'user', content: 'x', metadata: 'meta', create_time: 0, status: '' }, parent: ROOT, children: [] },
     n2: null,
     n3: 0,
-    n4: 'a node',
+    n4: `${MARK} a node`,
     n5: { message: 7 },
-    n6: { id: 'n6', parent: ROOT, children: [], message: { metadata: { model_slug: 'gpt-5', title: `${MARK} title`, request_id: 'r1', turn_exchange_id: null }, content: { content_type: 'text', parts: [`${MARK} text`] } } },
-    n7: { id: 'n7', message: { author: { role: 'tool', name: 'web.run' }, weight: 0, end_turn: false, recipient: '', channel: '', content: null, metadata: [] } },
-    n8: { id: 'n8', parent: null, children: null, message: { author: null, metadata: null } },
-    n9: { id: 'n9', parent: 'n8', children: [], message: true },
+    [nodeId(7)]: { id: nodeId(7), parent: ROOT, children: [], message: { author: { role: 'tool', name: 'web.run' }, weight: 0, end_turn: false, recipient: '', channel: '', content: null, metadata: [] } },
+    [nodeId(8)]: { id: nodeId(8), parent: null, children: null, message: { author: null, metadata: null } },
+    [nodeId(9)]: { id: nodeId(9), parent: nodeId(8), children: [], message: true },
   };
-  assert.deepEqual(parse({ mapping: odd }).skeleton, previousSkeleton({ mapping: odd }));
+  const none = { create_time: null, update_time: null, status: null, weight: null, end_turn: null, recipient: null, channel: null, content_type: null, metadata: {} };
+  assert.deepEqual(parse({ mapping: odd }).skeleton, {
+    [ROOT]: { id: ROOT, parent: null, children: [nodeId(1), nodeId(7)], message: null },
+    [nodeId(1)]: { id: nodeId(1), parent: ROOT, children: [], message: { ...none, author: { role: null, name: null }, create_time: 0, status: 'unrecognised' } },
+    n2: null,
+    n3: null,
+    n4: null,
+    n5: { id: null, parent: null, children: null, message: null },
+    [nodeId(7)]: {
+      id: nodeId(7), parent: ROOT, children: [],
+      message: { ...none, author: { role: 'tool', name: 'web.run' }, weight: 0, end_turn: false, recipient: 'unrecognised', channel: 'unrecognised' },
+    },
+    [nodeId(8)]: { id: nodeId(8), parent: null, children: null, message: { ...none, author: { role: null, name: null } } },
+    [nodeId(9)]: { id: nodeId(9), parent: nodeId(8), children: [], message: null },
+  });
 });
 
 test('nothing parsed holds text from the chat', () => {

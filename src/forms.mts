@@ -19,6 +19,11 @@ export const typeName = (value: unknown): string | null => (typeof value !== 'st
 
 export const flag = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
 
+// A message's status, from the closed set the capture saw: in_progress only on
+// thinking, finished_successfully on everything else.
+const STATUSES: ReadonlySet<string> = new Set(['finished_successfully', 'in_progress']);
+export const statusOf = (value: unknown): string | null => (typeof value !== 'string' ? null : STATUSES.has(value) ? value : 'unrecognised');
+
 // Epoch seconds from 2001 to 2286, the form the detail writes times in. A
 // time in milliseconds would otherwise read as a date some 50,000 years
 // ahead.
