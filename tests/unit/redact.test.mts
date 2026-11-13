@@ -645,12 +645,24 @@ test('2,000 seeded departures of the raw chats and list items: every record the 
   assert.ok(tally.details > 1000 && tally.summaries > 300 && tally.changed > 50, JSON.stringify(tally));
 });
 
+// Every module a source loads: import or export ... from, with either quote,
+// with or without a semicolon or attributes; a bare import for its side
+// effects; and import() and require(), listed by name.
+function modulesLoaded(source: string): string[] {
+  const named = [...source.matchAll(/^\s*(?:import|export)\b[^'"`;]*?\bfrom\s*(['"])(.+?)\1/gm)].map((match) => match[2]);
+  const bare = [...source.matchAll(/^\s*import\s*(['"])(.+?)\1/gm)].map((match) => match[2]);
+  const dynamic = [...source.matchAll(/\b(import|require)\s*\(/g)].map((match) => `${match[1]}()`);
+  return [...named, ...bare, ...dynamic];
+}
+
 test('the redactor imports nothing but rex-types, so the extension can carry a copy of it', () => {
-  const imports = (file: string) => {
-    const source = readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8');
-    assert.equal(/\bimport\s*\(|\brequire\s*\(/.test(source), false, `${file} loads a module at run time`);
-    return [...source.matchAll(/^import\b[^;]*?from\s+'([^']+)';/gm)].map((match) => match[1]);
-  };
-  assert.deepEqual(imports('keep.mts'), ['@bric/rex-types/types']);
-  assert.deepEqual(imports('redact.mts'), ['@bric/rex-types/types', './keep.mts']);
+  const sample = [
+    "import { a } from './a.mts';", 'import { b } from "./b.mts";', "import c from './c.mts';", "import * as d from './d.mts';", "import { e } from './e.mts'",
+    "import f from './f.json' with { type: 'json' };", "export { g } from './g.mts';", "export * from './h.mts';", "import './i.mts';", "const j = await import('./j.mts');",
+    "const k = require('./k.cjs');",
+  ].join('\n');
+  assert.deepEqual(modulesLoaded(sample), ['./a.mts', './b.mts', './c.mts', './d.mts', './e.mts', './f.json', './g.mts', './h.mts', './i.mts', 'import()', 'require()'], 'Test setup invalid: the scan misses a way to load a module');
+  const source = (file: string) => readFileSync(new URL(`../../src/${file}`, import.meta.url), 'utf8');
+  assert.deepEqual(modulesLoaded(source('keep.mts')), ['@bric/rex-types/types']);
+  assert.deepEqual(modulesLoaded(source('redact.mts')), ['@bric/rex-types/types', './keep.mts']);
 });
