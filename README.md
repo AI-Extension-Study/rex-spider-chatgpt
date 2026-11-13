@@ -1,30 +1,30 @@
 # rex-spider-chatgpt
 
-The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the extension's other chatbot crawlers also use, so one analysis reads them all.
+The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the Gemini fork also uses.
 
-**Where it stands, 2026-11-13.** This fork's `main` is `74712d8`. The extension does not install it yet: its main branch and its newest release still install bric-digital's `2af116b`, the code this fork started from. A live detail pass on 2026-11-13, on one real account with no upload module loaded, sent 121 records (118 detail records, and 3 summaries in place of reads that failed); all 121 were in format 1 and came back whole through `src/redact.mts`.
+**Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension's main branch pins this fork at `74712d8` since 2026-11-13; no release of the extension carries it yet.
 
 ## What it collects
 
 | | summary mode | detail mode |
 |---|---|---|
 | per chat | id, created and last-changed times from the chat list, archived, starred, pinned time, temporary, do-not-remember, memory scope, async status, and SHA-256 hashes of the title, the gizmo id (a project or a custom GPT) and the template id | the same keys from the chat itself except async status, plus the default model, study mode, the id of the message ChatGPT shows as current, the gizmo type, and `user_agent` |
-| per turn: a prompt, or a reply | nothing | speaker, time, parent turn, whether it is on the branch ChatGPT shows, and five counts; ChatGPT's extras: content type and status, and for a reply its model and how many messages it folds |
-| per message of the chat's tree | nothing | the tree without its content (`metadata.mapping`): ids and links, author role and name, times, status, recipient, channel, content type, and ten metadata keys holding model names, timings and request ids |
+| per turn: a prompt, or a reply | nothing | the message id, speaker, time, parent turn, whether it is on the branch ChatGPT shows, and five counts; ChatGPT's extras: content type and status, and for a reply its model and how many messages it folds |
+| per message of the chat's tree | nothing | the tree without its content (`metadata.mapping`): ids and links, author role and name, times, status, weight, `end_turn`, recipient, channel, content type, and ten metadata keys: two model names, the message type, the thinking effort, three timings, and the ids `request_id`, `working_turn_id` and `turn_exchange_id` |
 
 Never collected: titles (only the hash), message text (only the counts), thinking, tool inputs and results, file names or contents, links, search queries, project names, and the owner details and text snippet a project's chat list carries.
 
 ## How a pass works
 
-The extension starts a crawl round every minute. rex-spider starts a ChatGPT pass when none is running and `sleep_delay` (5 minutes unless served) has passed since the last one.
+The extension starts a crawl round every minute, but only while an ID is stored and only when its configuration request gets an HTTP answer. rex-spider starts a ChatGPT pass when none is running and `sleep_delay` has passed since the last one.
 
 1. Read `https://chatgpt.com/` for the access token the site's own page carries.
-2. Walk the chat lists, `crawl_delay` (30 s unless served) between any two requests: the main list (`/backend-api/conversations`, 28 chats a page, newest change first, archived and starred chats left out), the same list for archived chats and for starred chats, the project sidebar, and each project's list. A chat list stops at an empty page or a page with no chat in the crawl window. A chat on several lists counts once.
+2. Walk the chat lists, `crawl_delay` between any two requests: the main list (`/backend-api/conversations`, 28 chats a page, newest change first, archived and starred chats left out), the same list for archived chats and for starred chats, the project sidebar, and each project's list. A chat list stops at an empty page or a page with no chat in the crawl window. A chat on several lists counts once.
 3. Check each chat in the window against the upload keys (see "Modes and the re-send"). The chats not sent yet go out newest change first.
 4. Summary mode builds each record from the list item. Detail mode reads the chat (`/backend-api/conversation/<id>`), one read per `crawl_delay` and never closer than 3 s, and builds the record from that.
-5. Send one completion event, `rex-spider-chatgpt-complete`.
+5. Send one completion event (see "Reading the completion events").
 
-Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first detail read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, so Chrome does not stop the service worker mid-pass, and every request gives up after 20 s. A list is cut after 1,000 pages, or after 3 pages in a row with no chat it had not given; a pass makes at most 5,000 list requests.
+Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first detail read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, so Chrome does not stop the service worker mid-pass, and every request gives up after 20 s. A list is cut after 1,000 pages, or after 3 pages in a row with no new chat; a pass makes at most 5,000 list requests.
 
 ## What a record holds
 
@@ -40,10 +40,10 @@ A turn is one prompt or one reply. A reply folds every visible assistant message
 | `parent` | the nearest turn above it on its branch; null for the first |
 | `speaker` | `user` or `assistant` |
 | `when` | the prompt's time, or the reply's first message's, in UTC to the microsecond |
-| `on_current_branch` | on the path to the message ChatGPT shows as current; a retry or an edit leaves the older branch `false`; null on every turn when that path cannot be traced |
+| `on_current_branch` | on the path to the message ChatGPT shows as current; turns on a branch ChatGPT does not show (after a retry or an edit) are `false`; null on every turn when that path cannot be traced |
 | `text_chars`, `text_words` | Unicode code points, and runs of non-space characters holding a letter or a digit, in the string parts of `text` and `multimodal_text` content and in a voice transcript. Code and its output count 0; images, files and a Deep Research report are not counted |
 | `citation_count` | cited passages: entries of `content_references` of type `grouped_webpages`. 0 on a prompt; null when no message of the reply carries `content_references` |
-| `search_result_count` | distinct web search results returned to the reply: from the tool messages between it and the turn above, else from the reply's own messages. 0 on a prompt and when no search ran; null when a search ran and no results are stored |
+| `search_result_count` | distinct web search results returned to the reply: from the tool messages on the path from the turn above to the reply's last message, else from the reply's own messages. 0 on a prompt and when no search ran; null when a search ran and no results are stored |
 | `attachments` | entries of the `attachments` lists of the prompt, or of the reply's messages; no list counts 0 |
 | `content_type`, `status` | extras: the content type and status (`finished_successfully`, `in_progress` or `unrecognised`) of the prompt, or of the reply's last message |
 | `model_slug`, `nodes` | extras on a reply: its last message's model, and how many messages it folds |
@@ -52,32 +52,32 @@ A count is null when what it is made from is missing or has another form, so a c
 
 ## Modes and the re-send
 
-`summarize: true` is summary mode; absent or `false` is detail mode. The spider takes the setting again at every configuration refresh, in both directions, and checks it before each chat: a change during a pass ends the sending, and the next pass runs in the new mode.
+`summarize: true` is summary mode; absent or `false` is detail mode. The spider takes the setting again, in both directions, at every configuration refresh whose configuration has a `chatgpt` or `default` block, and checks it before each chat: a change during a pass ends the sending, and the next pass runs in the new mode.
 
-Each mode has its own upload key: the bare chat id in summary mode, the key earlier builds wrote for both modes, and `<chat id>-detail` in detail mode. A chat is sent when it has no key in the served mode at its current list time. The spider stores the served mode and when this browser's first pass in it ran (`rex-spider-chatgpt-mode`). A chat with a key only in the other mode is sent again, once, if its last change is no earlier than 90 days before that pass; older chats keep the record they have. A browser with no stored mode counts as switching on its first pass. So an update to this build sends nothing again where summary mode is served, and where detail mode is served it sends the chats changed in the 90 days before, once, as detail records.
+Each mode has its own upload key: the bare chat id in summary mode, the key earlier builds wrote for both modes, and `<chat id>-detail` in detail mode. A chat with a key in the served mode at its current list time is not sent again, and one with no key in either mode is sent. The spider stores the served mode and when this browser's first pass in it ran (`rex-spider-chatgpt-mode`). A chat with a key only in the other mode is sent again, once, if its last change is no earlier than 90 days before that pass; older chats keep the record they have. A browser with no stored mode counts as switching on its first pass. So an update to this build sends nothing again where summary mode is served, and where detail mode is served it sends the chats changed in the 90 days before, once, as detail records.
 
 ## What is removed, and how
 
-1. The spider builds each record from the keys above and nothing else, each value in a checked form: an id must look like an id, a time like a time, and a label must be a type name (lowercase letters, digits, `_`, `.` and `-`, at most 64 characters). Any other value becomes null, or `unrecognised` where a label was expected. The title and the gizmo and template ids are hashed with SHA-256 in the spider, and the counts are made in the browser, so no text leaves the spider.
-2. The extension runs the redactor, `src/redact.mts` with its tables in `src/keep.mts`, on every ChatGPT point before upload. A record the spider built comes back key for key, each value written again from its checked form, and anything else is dropped at every level. Any other point keeps only `date`, `name`, `platform`, `identifier` (a UUID) and the uploader's own keys (`generatorId`, `_pdk_trace_context`, `passive-data-metadata`). The redactor never throws, because rex-content-processing uploads a failed processor's input unredacted.
+1. The spider builds each record from the keys above and nothing else, each value in a checked form: a time must read as a time, and a label must be a type name (lowercase letters, digits, `_`, `.` and `-`, at most 64 characters). Any other value becomes null, or `unrecognised` where a label was expected. The title and the gizmo and template ids are hashed with SHA-256 in the spider, and the counts are made in the browser, so no text leaves the spider.
+2. The extension runs the redactor, `src/redact.mts` with its tables in `src/keep.mts`, on every `rex-conversation` record with `platform` `chatgpt` before upload. A record the spider built comes back key for key, each value written again from its checked form, and anything else is dropped at every level. The redactor also holds every id to one form, a UUID or `client-created-root` for the root of a tree: an id in another form reads null, and a tree entry under such a key is dropped, which makes `turns_complete` false. Any other such record keeps only `date`, `name`, `platform`, `identifier` (a UUID) and the uploader's own keys (`generatorId`, `_pdk_trace_context`, `passive-data-metadata`). The redactor never throws, because rex-content-processing uploads a failed processor's input unredacted. Completion events are not filtered.
 
 The hashes use no secret key, so someone who guesses a title exactly can confirm the guess, and two chats with the same title share a hash.
 
 ## When something fails
 
 - A 429, a 503, any `Retry-After` header, or a Cloudflare challenge stops the pass and starts a back-off kept in the extension's storage: 5 minutes, doubling with each refusal in a row, longer if `Retry-After` asks, at most 6 hours. Passes during it end at once with no request. A pass that reads a list page with no refusal clears it.
-- No token on the home page, or a 401, ends the pass with no back-off: as `not-signed-in` at the home page or a list, and with `stop=not-signed-in` during the detail reads.
-- Any other failed detail read is that chat's alone. Its summary record goes out in the detail's place, once per list time, unless one already went out at that time. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a page that is not JSON) and 7 days otherwise; a chat that changes is read at once. Three failed reads in a row end the reads, or the first one when `halt_on_error` is true.
+- No token on the home page, or a 401, ends the pass with no back-off; the next pass reads the token again.
+- Any other failed detail read is that chat's alone. Its summary record goes out in the detail's place, once per list time, unless one already went out at that time. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a page that is not JSON) and 7 days otherwise; a chat that changes is read at once. Failed reads also end the pass's reads, as `halt_on_error` sets (see "Settings it reads").
 
 ## Reading the completion events
 
-Each pass sends one event, `rex-spider-chatgpt-complete`, with `crawled_count`, `crawled_ids` and `reason`. Only `ok` comes with a count of 0 or more (the records sent) and the ids of every chat listed in the crawl window. Every other reason comes with -1 and no ids, so a list read in part never looks like deleted chats. A reason is a code followed by `key=value` fields, never free text, such as `ok seen=124 dispatched=121 failed=3 left=3 stop=failed-reads ms=4171637`.
+Each pass sends one event, `rex-spider-chatgpt-complete`, with `crawled_count`, `crawled_ids` and `reason`. Only `ok` comes with a count of 0 or more (the records sent) and the ids of every chat listed in the crawl window. Every other reason comes with -1 and no ids, so a list read in part never looks like deleted chats. A reason is a code followed by `key=value` fields, never free text, such as `ok seen=40 dispatched=8 failed=3 left=30 stop=failed-reads ms=560000` (made-up numbers).
 
 | code | meaning |
 |---|---|
 | `ok` | every list read to its end: `seen` chats in the window, `dispatched` records sent |
 | `partial` | a list failed or was cut; the same fields as `ok` |
-| `not-signed-in` | no token, or a 401 |
+| `not-signed-in` | no token, or a 401 at the home page or a list; a 401 during the detail reads shows as `stop=not-signed-in` |
 | `rate-limited`, `challenge` | the site asked for a wait, and a back-off started |
 | `backoff` | skipped: a back-off runs `until` the time given |
 | `list-failed` | the lists were read only in part and gave no chat in the window |
@@ -96,9 +96,9 @@ rex-spider merges `spider.spiders.chatgpt` over `spider.spiders.default` from th
 | `enabled` | `true` | `false` stops a pass before its next request |
 | `summarize` | absent | `true` for summary mode, else detail mode |
 | `halt_on_error` | `true` | `true` ends the detail reads at the first failed read, `false` at three in a row |
-| `crawl_delay` | `30000` | ms between requests; a value that is neither a number nor a numeric string counts as 30000 |
+| `crawl_delay` | `30000` | ms between requests; any value that does not read as a number of 0 or more counts as 30000 |
 | `sleep_delay` | `300000` | ms between passes, applied by rex-spider |
-| `start`, `end`, `time_anchor` | none, none, `runtime` | the crawl window in ms around `time_anchor` (`install`, `absolute` or `runtime`); a chat is in it by its list `update_time` |
+| `start`, `end`, `time_anchor` | none, none, `runtime` | the crawl window: `start` and `end` in ms from the install time (`install`) or from now (`runtime`), or as epoch ms (`absolute`); a chat is in it by its list `update_time` |
 
 ## What it cannot see
 
@@ -112,7 +112,7 @@ Node 24.11 or later. `npm ci`, then `npm run lint` and `npm run test:unit` (Node
 
 ## How a change reaches the extension
 
-The extension installs this module from a pinned commit. Once it pins this fork, it carries a copy of `src/redact.mts` and `src/keep.mts` from that commit as its ChatGPT case. A change here reaches participants only after the extension pins the new commit, its copy of the two files is made again from that commit, and a release ships both.
+The extension installs this module from a pinned commit and carries a copy of `src/redact.mts` and `src/keep.mts` from that commit as its ChatGPT case. A change here reaches participants only after the extension pins the new commit, its copy of the two files is made again from that commit, and a release ships both.
 
 ## Where to read next
 
