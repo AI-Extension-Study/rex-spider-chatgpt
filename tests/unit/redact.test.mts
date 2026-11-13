@@ -12,7 +12,7 @@ import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/reco
 import { redactChatGPT } from '../../src/redact.mts';
 import { skeletonOf } from '../../src/skeleton.mts';
 import {
-  CHAT_ID, LIST_CREATED, MARK, PROJECT_ID, ROOT, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, listItem,
+  CHAT_ID, LIST_CREATED, LIST_UPDATED, MARK, PROJECT_ID, ROOT, T0, answer, attachment, detail, editedFirstPromptDetail, group, hiddenContext, imagePart, listItem,
   nodeId, nodeOf, oddTree, projectItem, prompt, reasoningDetail, reference, searchCall, systemMessage, toolResult, tree,
 } from './fixtures.mts';
 
@@ -313,6 +313,85 @@ test('a value out of its form is null, and a string out of its type name or clos
   });
 });
 
+// Text glued to a value otherwise in form, before or after it, or after a
+// space or a newline: each form is anchored at both ends, so none is kept.
+const riders = (value: string): string[] => [`${MARK}${value}`, `${value}${MARK}`, `${value} ${MARK}`, `${value}\n${MARK}`];
+// Temporal.Instant, as rex-types reads with it: it takes an annotation such
+// as [x=MARKER] after the Z and ignores it, so only the shape stops one.
+const temporalReads = (text: string): boolean => {
+  try {
+    ((new DateString(LIST_CREATED).value as object).constructor as unknown as { from(item: string): unknown }).from(text);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test('text riding on a value otherwise in form is not kept: ids, keys and links null or dropped, digests and times null, a long type name unrecognised', () => {
+  const [user, reply] = DETAIL.turns as Json[];
+  const metadata = DETAIL.metadata as Json;
+  const mapping = metadata.mapping as Record<string, Json>;
+  const node = mapping[nodeId(4)];
+  const message = node.message as Json;
+  for (const odd of [...riders(nodeId(4)), ...riders(ROOT)]) {
+    const out = redact({
+      ...DETAIL,
+      turns: [{ ...user, identifier: odd, parent: odd }, reply],
+      metadata: {
+        ...metadata, conversation_id: odd, current_node: odd,
+        mapping: {
+          ...mapping, [odd]: { ...node },
+          [nodeId(4)]: { ...node, id: odd, parent: odd, children: [odd], message: { ...message, metadata: { ...(message.metadata as Json), request_id: odd, turn_exchange_id: odd, working_turn_id: odd } } },
+        },
+      },
+    });
+    const kept = out.metadata as Json;
+    const nodes = kept.mapping as Record<string, Json>;
+    const held = nodes[nodeId(4)];
+    const ids = (held.message as Json).metadata as Json;
+    assert.deepEqual(
+      [(out.turns as Json[])[0].identifier, (out.turns as Json[])[0].parent, kept.conversation_id, kept.current_node, held.id, held.parent, held.children, ids.request_id, ids.turn_exchange_id, ids.working_turn_id, Object.hasOwn(nodes, odd)],
+      [null, null, null, null, null, null, [null], null, null, null, false],
+      JSON.stringify(odd),
+    );
+    assert.deepEqual(redact({ ...SUMMARY, identifier: odd }), { date: SUMMARY.date, name: 'rex-conversation', platform: 'chatgpt' }, JSON.stringify(odd));
+  }
+  const ended = SUMMARY.ended as DateString;
+  const annotated = `${LIST_UPDATED}[x=${MARK}]`;
+  assert.ok(temporalReads(annotated), 'Test setup invalid: Temporal no longer reads an annotated time, so this cannot see a shape check go');
+  for (const time of [...riders(LIST_UPDATED), annotated]) {
+    const out = redact({ ...SUMMARY, metadata: { ...(SUMMARY.metadata as Json), create_time: time, update_time: time, pinned_time: time } });
+    const kept = out.metadata as Json;
+    assert.deepEqual([kept.create_time, kept.update_time, kept.pinned_time], [null, null, null], JSON.stringify(time));
+    assert.deepEqual(redact({ ...SUMMARY, ended: { value: ended.value, originalValue: `other:${time}` } }), { date: SUMMARY.date, name: 'rex-conversation', platform: 'chatgpt', identifier: CHAT_ID }, JSON.stringify(time));
+  }
+  for (const digest of riders('f'.repeat(64))) {
+    for (const record of [SUMMARY, DETAIL]) {
+      const kept = redact({ ...record, metadata: { ...(record.metadata as Json), title_hash: digest, gizmo_id_hash: digest, conversation_template_id_hash: digest } }).metadata as Json;
+      assert.deepEqual([kept.title_hash, kept.gizmo_id_hash, kept.conversation_template_id_hash], [null, null, null], JSON.stringify(digest));
+    }
+  }
+  // 64 characters is a type name; 65 is not.
+  const [long, longest] = ['a'.repeat(64), 'a'.repeat(65)];
+  const out = redact({
+    ...DETAIL,
+    turns: [user, { ...reply, model_slug: longest, content_type: long }],
+    metadata: { ...metadata, memory_scope: longest, gizmo_type: long, mapping: { ...mapping, [nodeId(4)]: { ...node, message: { ...message, recipient: longest, channel: long } } } },
+  });
+  const kept = out.metadata as Json;
+  const held = (kept.mapping as Record<string, Json>)[nodeId(4)].message as Json;
+  assert.deepEqual(
+    [(out.turns as Json[])[1].model_slug, (out.turns as Json[])[1].content_type, kept.memory_scope, kept.gizmo_type, held.recipient, held.channel],
+    ['unrecognised', long, 'unrecognised', long, 'unrecognised', long],
+  );
+});
+
+test('a key held only through the prototype reads as missing', () => {
+  const kept = redact({ ...SUMMARY, metadata: Object.create(SUMMARY.metadata as object) }).metadata as Json;
+  assert.deepEqual(kept, Object.fromEntries(Object.keys(SUMMARY.metadata as Json).map((key) => [key, null])));
+  assert.equal(redact({ ...DETAIL, turns: [Object.create((DETAIL.turns as Json[])[0]), (DETAIL.turns as Json[])[1]] }).is_summary, undefined, 'a turn whose keys are all inherited was kept');
+});
+
 test('summary metadata keeps its twelve keys, each only in its form', () => {
   const out = redact({
     ...SUMMARY,
@@ -331,7 +410,9 @@ test('summary metadata keeps its twelve keys, each only in its form', () => {
 test('every metadata key is written, null where the record has none, in the builders\' order', () => {
   for (const record of [SUMMARY, DETAIL]) {
     const nulls = Object.fromEntries(Object.keys(record.metadata as Json).map((key) => [key, key === 'mapping' ? {} : null]));
-    assert.equal(JSON.stringify(redact({ ...record, metadata: {} }).metadata), JSON.stringify(nulls), `is_summary ${String(record.is_summary)}`);
+    const metadata = redact({ ...record, metadata: {} }).metadata as Json;
+    // As objects, so a key whose value is undefined still shows.
+    assert.deepEqual([Object.keys(metadata), metadata], [Object.keys(nulls), nulls], `is_summary ${String(record.is_summary)}`);
   }
 });
 
@@ -373,8 +454,18 @@ test('a turn under a node the id rule drops reads parent null, and the turns rea
   assert.equal(out.turns_complete, false);
 });
 
-test('no text gets through: content*, metadata*, a raw tree with message content, a cleartext title, a project item\'s owner and snippet', () => {
-  const raw = reasoningDetail();
+// A copy with the marker in every leaf: after each string, in place of each
+// null, and in each empty list and empty object. Numbers and flags stay.
+function markLeaves(value: unknown): unknown {
+  if (typeof value === 'string') return `${value}${MARK}`;
+  if (value === null) return MARK;
+  if (Array.isArray(value)) return value.length === 0 ? [MARK] : value.map(markLeaves);
+  if (typeof value === 'object') return Object.keys(value).length === 0 ? { text: MARK } : Object.fromEntries(Object.entries(value).map(([key, held]) => [key, markLeaves(held)]));
+  return value;
+}
+
+test('no text gets through: content*, metadata*, a raw tree marked in every leaf, a cleartext title, a project item\'s owner and snippet', () => {
+  const raw = markLeaves(reasoningDetail()) as Json;
   const [project] = RECORDS.filter(([what]) => what.includes('project list')).map(([, record]) => record);
   const old = {
     name: 'rex-conversation', platform: 'chatgpt', identifier: CHAT_ID, date: new Date(T0 * 1000), started: new DateString(T0), ended: new DateString(T0),
