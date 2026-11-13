@@ -14,7 +14,7 @@ export const isObject = (value: unknown): value is Readonly<Record<string, unkno
 
 // An own key's value, or undefined: a key named like one of Object's own
 // (constructor, toString) is never read through the prototype.
-const ownField = (value: unknown, key: string): unknown => (isObject(value) && Object.hasOwn(value, key) ? value[key] : undefined);
+export const ownField = (value: unknown, key: string): unknown => (isObject(value) && Object.hasOwn(value, key) ? value[key] : undefined);
 
 // Model slugs, roles, recipients, channels, content types, memory scopes and
 // gizmo types: lowercase letters, digits, _, . and -, at most 64 characters.
@@ -101,7 +101,7 @@ const NODE = {
 // The skeleton: each node under its key. A key that is no node id is dropped
 // with its node, since a key cannot be null and could hold any text; a link
 // naming it fails the same rule and reads null.
-const keepMapping = (value: unknown): Record<string, unknown> => (isObject(value)
+export const keepMapping = (value: unknown): Record<string, unknown> => (isObject(value)
   ? Object.fromEntries(Object.entries(value).filter(([key]) => asNodeId(key) !== null).map(([key, node]) => [key, isObject(node) ? keepAll(NODE, node) : null]))
   : {});
 
@@ -109,11 +109,12 @@ export const SUMMARY_METADATA = {
   create_time: asListTime, update_time: asListTime, is_archived: asFlag, is_starred: asStarred, pinned_time: asListTime, is_temporary_chat: asFlag,
   is_do_not_remember: asFlag, memory_scope: asTypeName, async_status: asTypeName, title_hash: asHash, gizmo_id_hash: asHash, conversation_template_id_hash: asHash,
 };
-// redact.mts keeps current_node only when it names a node of the kept mapping.
+// The detail's metadata but its mapping, which redact.mts adds last with
+// keepMapping, and keeps current_node only when it names a node of it.
 export const DETAIL_METADATA = {
   conversation_id: asUuid, create_time: asSeconds, update_time: asSeconds, default_model_slug: asTypeName, is_archived: asFlag, is_starred: asStarred,
   pinned_time: asSeconds, is_temporary_chat: asFlag, is_do_not_remember: asFlag, memory_scope: asTypeName, is_study_mode: asFlag, current_node: asNodeId,
-  gizmo_type: asTypeName, title_hash: asHash, gizmo_id_hash: asHash, conversation_template_id_hash: asHash, mapping: keepMapping,
+  gizmo_type: asTypeName, title_hash: asHash, gizmo_id_hash: asHash, conversation_template_id_hash: asHash,
 };
 
 // A turn's keys in the standard's order, then ChatGPT's extras. A speaker

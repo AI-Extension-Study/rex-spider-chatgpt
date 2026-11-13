@@ -281,7 +281,7 @@ test('a turn that is not an object is dropped, and the turns read incomplete', (
   assert.equal(wire(out).includes(MARK), false);
 });
 
-test('a mapping entry whose key is no node id is dropped, and a link naming it reads null', () => {
+test('a mapping entry whose key is no node id is dropped, a link naming it reads null, and the turns read incomplete', () => {
   const metadata = DETAIL.metadata as Json;
   const mapping = metadata.mapping as Record<string, Json>;
   const odd = `${MARK} node`;
@@ -292,8 +292,25 @@ test('a mapping entry whose key is no node id is dropped, and a link naming it r
   const kept = out.metadata as Json;
   assert.equal(out.is_summary, false, 'the record was cut to the scaffold');
   assert.deepEqual(Object.keys(kept.mapping as Json), Object.keys(mapping));
-  assert.deepEqual([(kept.mapping as Record<string, Json>)[nodeId(4)].children, kept.current_node], [[null], null]);
+  assert.deepEqual([(kept.mapping as Record<string, Json>)[nodeId(4)].children, kept.current_node, out.turns_complete], [[null], null, false]);
   assert.equal(wire(out).includes(MARK), false);
+});
+
+// A node id of another form, in the builders' record of a whole tree: the
+// turn below it would read parent null, as a first turn does.
+test('a turn under a node the id rule drops reads parent null, and the turns read incomplete', async () => {
+  const chat = detail(tree(
+    [ROOT, null, null],
+    [nodeId(1), ROOT, prompt(nodeId(1), T0 + 1)],
+    [nodeId(2), nodeId(1), answer(nodeId(2), T0 + 2, MARK)],
+    ['msg_0002', nodeId(2), prompt('msg_0002', T0 + 3)],
+    [nodeId(4), 'msg_0002', answer(nodeId(4), T0 + 4, MARK)],
+  ), nodeId(4));
+  const record = await detailOf(chat);
+  assert.equal(record.turns_complete, true, 'Test setup invalid: the builder already says the turns are incomplete');
+  const out = redact(record);
+  assert.deepEqual((out.turns as Json[]).map((turn) => [turn.identifier, turn.parent]), [[nodeId(1), null], [nodeId(2), nodeId(1)], [null, nodeId(2)], [nodeId(4), null]]);
+  assert.equal(out.turns_complete, false);
 });
 
 test('no text gets through: content*, metadata*, a raw tree with message content, a cleartext title, a project item\'s owner and snippet', () => {

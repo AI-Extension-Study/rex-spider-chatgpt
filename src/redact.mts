@@ -10,7 +10,7 @@
 // two import nothing but rex-types. Pure.
 import { DateString } from '@bric/rex-types/types';
 
-import { DETAIL_METADATA, INSTANT_TO_STRING, REPLY, SUMMARY_METADATA, TURN, asListTime, asSeconds, asUuid, isObject, keepAll } from './keep.mts';
+import { DETAIL_METADATA, INSTANT_TO_STRING, REPLY, SUMMARY_METADATA, TURN, asListTime, asSeconds, asUuid, isObject, keepAll, keepMapping, ownField } from './keep.mts';
 
 const NAME = 'rex-conversation';
 const PLATFORM = 'chatgpt';
@@ -118,11 +118,17 @@ export function redactChatGPT(event: Record<string, unknown>): Record<string, un
       return scaffold;
     }
     const detail = keepAll(DETAIL_METADATA, metadata);
-    if (detail.current_node !== null && !Object.hasOwn(detail.mapping as object, detail.current_node as string)) {
+    const tree = ownField(metadata, 'mapping');
+    const mapping = keepMapping(tree);
+    detail.mapping = mapping;
+    if (detail.current_node !== null && !Object.hasOwn(mapping, detail.current_node as string)) {
       detail.current_node = null;
     }
-    // A turn dropped here, as not an object, leaves the turns incomplete.
-    const whole = complete === true && objects.length === (turns as unknown[]).length;
+    // A turn dropped here, as not an object, leaves the turns incomplete; so
+    // does a mapping entry the id rule drops, since a turn below it then reads
+    // parent null, as a first turn does.
+    const dropped = isObject(tree) && Object.keys(tree).length > Object.keys(mapping).length;
+    const whole = complete === true && objects.length === (turns as unknown[]).length && !dropped;
     return { ...head, user_agent: agent, turns: kept, turns_complete: whole, metadata: detail };
   } catch {
     return scaffold;
