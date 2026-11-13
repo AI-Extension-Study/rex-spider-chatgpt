@@ -2,7 +2,7 @@
 
 The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the Gemini fork also uses.
 
-**Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension's main branch pins this fork at `74712d8` since 2026-11-13; no release of the extension carries it yet.
+**Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension installs this fork at `74712d8` from its release v0.0.59 (2026-11-13) on.
 
 ## What it collects
 
