@@ -29,12 +29,16 @@ const asFlag = (value: unknown): boolean | null => (typeof value === 'boolean' ?
 const asStarred = (value: unknown): true | null => (value === true ? true : null);
 const asCount = (value: unknown): number | null => (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null);
 const asFinite = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
-// Epoch seconds from 2001 to 2286, the form a detail writes times in, so a
-// time in milliseconds is not taken for one some 50,000 years ahead.
+// Epoch seconds from 2001 to 2286. A detail writes its times in seconds,
+// and the bound keeps a time in milliseconds from reading as one some 50,000
+// years ahead. A project list's started and ended are DateStrings built from
+// seconds too (redact.mts reads them as 'number:' sources) and are held to
+// the same range, so a project list time outside it cuts the record to the
+// scaffold; no list has sent one.
 export const asSeconds = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) && value >= 1e9 && value < 1e10 ? value : null);
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-export const asUuid = (value: unknown): string | null => (typeof value === 'string' && UUID.test(value) ? value : null);
+const UUID_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const asUuid = (value: unknown): string | null => (typeof value === 'string' && UUID_FORM.test(value) ? value : null);
 // The one id rule of the tree, for mapping keys, the links between nodes,
 // current_node and a turn's identifier and parent: a UUID, as every message
 // id the capture saw, or client-created-root, the root a browser makes. Only

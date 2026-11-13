@@ -3,11 +3,14 @@
 // upload. A record buildSummaryRecord or buildDetailRecord made, in the
 // standard record layout (format 1), comes back equal, each value written
 // from its checked form (keep.mts) and every other key dropped, at every
-// level. Any other point keeps only the scaffold: the fields the processor
-// keeps for a point of no known platform, each in its form. The case never
-// throws, because rex-content-processing uploads a failed processor's input
-// unredacted. The extension carries a copy of this file and keep.mts, so the
-// two import nothing but rex-types. Pure.
+// level, but in two cases. An id outside the one id rule reads null, and a
+// mapping entry under such a key is dropped, which marks the turns
+// incomplete. A project list time outside 2001 to 2286 cuts the record to
+// the scaffold (asSeconds). Any other point keeps only the scaffold: the
+// fields the processor keeps for a point of no known platform, each in its
+// form. The case never throws, because rex-content-processing uploads a
+// failed processor's input unredacted. The extension carries a copy of this
+// file and keep.mts, so the two import nothing but rex-types. Pure.
 import { DateString } from '@bric/rex-types/types';
 
 import { DETAIL_METADATA, INSTANT_TO_STRING, REPLY, SUMMARY_METADATA, TURN, asListTime, asSeconds, asUuid, isObject, keepAll, keepMapping, ownField } from './keep.mts';
