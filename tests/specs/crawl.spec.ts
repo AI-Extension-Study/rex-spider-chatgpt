@@ -346,3 +346,41 @@ test('summarize served true, then false, then true: each switch re-sends, in the
   ].sort())
   await expectAllRouted(serviceWorker, site, unrouted)
 })
+
+// The study's configs serve halt_on_error false. rex-spider's own flag, once
+// false, never turns true again, so the spider keeps its own, and a config
+// that leaves the key out brings back the default: the reads stop at the
+// first that fails.
+test('served halt_on_error false, a refused read sends its summary and the reads go on; served without it, they stop at the next failure', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const now = Date.now()
+  const site = new Site()
+  site.main.push(mainItem(chat(1), now - HOUR_MS), mainItem(chat(2), now - 2 * HOUR_MS))
+  for (const n of [1, 2, 3, 4]) site.details.set(chat(n), simpleDetail(chat(n)))
+  // A refusal of one chat's detail counts against that chat alone.
+  const refused = { status: 403, body: JSON.stringify({ detail: 'Forbidden' }) }
+  site.refusals.set(chat(1), [refused])
+  site.refusals.set(chat(3), [refused])
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  const sentIn = (round) => records(round.events).map((record) => [record.identifier, record.is_summary ? 'summary' : 'detail'])
+
+  await serve(serviceWorker, { halt_on_error: false })
+  const first = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual([...listWalk(), `GET detail ${chat(1)} 403`, `GET detail ${chat(2)}`])
+  // The refused chat's summary goes out in its place, and a memo holds the
+  // chat back for a week.
+  expect(sentIn(first)).toEqual([[chat(1), 'summary'], [chat(2), 'detail']])
+  expect(completions(first.events)).toEqual([[2, [chat(1), chat(2)], reason('ok seen=2 dispatched=2 failed=1')]])
+  const memo = await storedValue(serviceWorker, `rex-spider-chatgpt-detail-memo-${chat(1)}`)
+  expect([memo.ended, memo.retryMs, memo.failures]).toEqual([Date.parse(site.main[0].update_time), 7 * 24 * HOUR_MS, 1])
+
+  // A new chat whose read is refused, and an older one after it.
+  site.main.push(mainItem(chat(3), now - HOUR_MS / 2), mainItem(chat(4), now - 3 * HOUR_MS))
+  await serve(serviceWorker)
+  const second = await crawl(serviceWorker)
+  expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(3)} 403`])
+  expect(sentIn(second)).toEqual([[chat(3), 'summary']])
+  expect(completions(second.events)).toEqual([[1, [chat(3), chat(1), chat(2), chat(4)], reason('ok seen=4 dispatched=1 failed=1 left=2 stop=halt-on-error')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
