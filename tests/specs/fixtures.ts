@@ -8,6 +8,7 @@ export const test = base.extend<{
   context: BrowserContext
   extensionId: string,
   serviceWorker:ServiceWorker,
+  unrouted: string[],
 }>({
   context: async ({ }, use) => {
     const __filename = fileURLToPath(import.meta.url);
@@ -53,6 +54,17 @@ export const test = base.extend<{
       .then(() => {
         context.close();
     })
+  },
+  // Every http(s) request no route of the spec answers is aborted here and
+  // written down, so nothing a spec runs reaches a real site. Routes the spec
+  // adds later are tried before this one.
+  unrouted: async ({ context }, use) => {
+    const urls: string[] = []
+    await context.route(/^https?:\/\//, async (route) => {
+      urls.push(route.request().url())
+      await route.abort()
+    })
+    await use(urls)
   },
 });
 
