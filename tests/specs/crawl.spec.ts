@@ -12,7 +12,7 @@ import crypto from 'node:crypto'
 
 import { test, expect } from './fixtures'
 import {
-  MARK, ROUTE_NAME, Site, answerChatGPT, attachmentsChat, daysAgo, editedChat, mainItem, projectChat, reasoningChat,
+  MARK, ROUTE_NAME, Site, answerChatGPT, attachmentsChat, daysAgo, editedChat, mainItem, projectChat, reasoningChat, simpleDetail,
 } from './chatgpt-site'
 import { checkRecord } from './standard-check'
 
@@ -245,5 +245,35 @@ test('served no summarize, a crawl reads each chat and sends detail records that
   expect(site.calls).toEqual(listWalk())
   expect(records(second.events)).toEqual([])
   expect(completions(second.events)).toEqual([[0, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=0')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// The configs of a study that has ended serve enabled false. The pass reads
+// the spider's flags as rex-spider last set them before each chat, so a
+// refresh that lands between two detail reads stops it before the next one.
+test('enabled false served through a configuration refresh between two detail reads ends the pass there, with no request after it', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const now = Date.now()
+  const site = new Site()
+  for (const n of [1, 2, 3]) {
+    site.main.push(mainItem(chat(n), now - n * HOUR_MS))
+    site.details.set(chat(n), simpleDetail(chat(n)))
+  }
+  // While the first detail read waits for its answer, a refresh brings a
+  // config that switches the spider off.
+  site.beforeDetail = async (id) => {
+    if (id === chat(1)) await serve(serviceWorker, { enabled: false })
+  }
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker)
+
+  const round = await crawl(serviceWorker)
+  expect(site.calls).toEqual([...listWalk(), `GET detail ${chat(1)}`])
+  expect(records(round.events).map((record) => [record.identifier, record.is_summary])).toEqual([[chat(1), false]])
+  expect(completions(round.events)).toEqual([[1, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=1 left=2 stop=disabled')]])
+  // The record that went out before the switch-off keeps its key.
+  expect(await uploadKeys(serviceWorker)).toEqual([uploadKey(`${chat(1)}-detail`, Date.parse(site.main[0].update_time))])
+  expect(await serviceWorker.evaluate(() => self.rexChatGPTPlugin.isEnabled())).toBe(false)
   await expectAllRouted(serviceWorker, site, unrouted)
 })

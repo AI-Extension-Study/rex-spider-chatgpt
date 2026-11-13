@@ -87,12 +87,12 @@ export class Site {
     }
     const call = method === 'GET' ? this.callOf(path) : null
     if (call === null) return this.written(`${method} ${path} (not a request the spider makes)`, { status: 404, body: '' })
+    if (call.chat !== undefined) await this.beforeDetail(call.chat)
     const token = authorization?.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : null
     if (token === null || !this.tokens.includes(token) || this.expired.has(token)) {
       return this.written(call.line, { status: 401, body: JSON.stringify({ detail: 'Could not parse your authentication token. Please try signing in again.' }) })
     }
     if (call.chat !== undefined) {
-      await this.beforeDetail(call.chat)
       const refusal = this.refusals.get(call.chat)?.shift()
       if (refusal !== undefined) return this.written(call.line, refusal)
       const held = this.details.get(call.chat)
