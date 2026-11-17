@@ -91,6 +91,12 @@ test('a record is sent when none was, when it changed, or when the last was sent
   assert.equal(shouldSend({ hash: HASH, sentAt: NOW, readAt: NOW }, 'b'.repeat(64), NOW), true);
 });
 
+test('a last send more than 5 minutes ahead of the clock means the clock went back, and the record is sent', () => {
+  assert.equal(shouldSend({ hash: HASH, sentAt: NOW + 6 * MINUTE, readAt: NOW }, HASH, NOW), true);
+  assert.equal(shouldSend({ hash: HASH, sentAt: NOW + 5 * MINUTE, readAt: NOW }, HASH, NOW), false);
+  assert.equal(shouldSend({ hash: HASH, sentAt: NOW + 4 * MINUTE, readAt: NOW }, HASH, NOW), false);
+});
+
 // --- isAccountState ---
 
 test('only a stored state of the right form is trusted', () => {
@@ -311,6 +317,25 @@ test('account_created and the metadata times are kept only as instants, written 
   assert.equal(record.account_created, null);
   assert.equal('cancels_at' in record.metadata, false);
   assert.equal('renews_at' in record.metadata, false);
+});
+
+test('every time sent has the one form: UTC, Z, a four-digit year', () => {
+  const answers = accountAnswers();
+  const entitlement = at(answers.accounts_check.body, 'accounts', ACCOUNT_KEY, 'entitlement');
+  entitlement.cancels_at = '2026-12-01T10:20:30.123456789+0130';
+  entitlement.renews_at = '2026-12-01T10:20:30+01';
+  let record = build(answers);
+  const sent = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+  for (const time of [record.account_created, record.metadata.cancels_at, record.metadata.renews_at]) {
+    assert.match(String(time), sent);
+  }
+  assert.equal(record.metadata.cancels_at, '2026-12-01T08:50:30.123456789Z');
+  // An offset that carries the year past 9999 would be written +010000-...
+  theAccount(answers).created_time = '9999-12-31T23:00:00-05:00';
+  entitlement.cancels_at = '9999-12-31T23:00:00-05:00';
+  record = build(answers);
+  assert.equal(record.account_created, null);
+  assert.equal('cancels_at' in record.metadata, false);
 });
 
 test('a metadata value of the wrong form is left out, and the rest kept', () => {

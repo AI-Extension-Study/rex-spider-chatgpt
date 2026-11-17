@@ -65,9 +65,9 @@ export interface AccountSettings {
 const DEFAULT_INTERVAL_MINUTES = 60;
 const MIN_INTERVAL_MINUTES = 15;
 const MAX_INTERVAL_MINUTES = 24 * 60;
-// A stored read time further ahead than this was written by a clock that has
-// since gone back. Honoured, it would hold off every read until the clock
-// caught up.
+// A stored read or send time further ahead than this was written by a clock
+// that has since gone back. Honoured, it would hold off every read, or the
+// daily send, until the clock caught up.
 const CLOCK_SLACK_MS = 5 * 60_000;
 // A record goes out at least once a day, so a day with none means the read
 // failed, not that nothing changed.
@@ -120,7 +120,11 @@ export function accountDue(state: AccountState | null, now: number, intervalMinu
 }
 
 export function shouldSend(state: AccountState | null, hash: string, now: number): boolean {
-  return state === null || state.hash !== hash || now - state.sentAt >= RESEND_MS;
+  if (state === null || state.hash !== hash) {
+    return true;
+  }
+  const sinceMs = now - state.sentAt;
+  return sinceMs < -CLOCK_SLACK_MS || sinceMs >= RESEND_MS;
 }
 
 // --- The hash ---
@@ -201,6 +205,8 @@ const formed = (value: unknown, form: RegExp): string | null => (typeof value ==
 // February, hour 24); DateString is not used to check, since it logs the
 // value it cannot read.
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)$/;
+// The one form a time is sent in: UTC, Z, and a four-digit year.
+const SENT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
 
 // Temporal.Instant, taken from a DateString's value so it is the copy
 // rex-types reads with.
@@ -208,13 +214,15 @@ const INSTANT = (new DateString('1970-01-01T00:00:00Z').value as object).constru
 
 // The instant written in UTC with Z, as Temporal writes it, so every record
 // writes a time the same way whatever offset the site used. Null for
-// anything else.
+// anything else, and for an offset that carries the year past 9999, which
+// Temporal writes +010000-...
 function instantOf(value: unknown): string | null {
   if (typeof value !== 'string' || !ISO_INSTANT.test(value)) {
     return null;
   }
   try {
-    return INSTANT.from(value).toString();
+    const utc = INSTANT.from(value).toString();
+    return SENT_INSTANT.test(utc) ? utc : null;
   } catch {
     return null;
   }
