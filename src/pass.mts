@@ -635,10 +635,14 @@ async function crawlWindow(pass: Pass): Promise<CrawlWindow | null> {
 type SourceRead = { readonly answer: AccountAnswer } | { readonly stop: true };
 
 // One account source. A wait asked for, a challenge, a 401 or a 403 would
-// meet every source after it too, so it stops the reads. Any other failure
-// (no answer, a 5xx, a 404, a page that is not JSON) is that source's alone:
-// its status, or -1, goes in the record, and its keys are null. The log
-// names the kind of failure and the status, never the answer's text.
+// meet every source after it too, so it stops the reads. So does an answer
+// fetch reached through a redirect: it is another page's (a sign-in page, or
+// one a browser rule chose), and a 200 from it would go in the record as the
+// source's, whatever its status. Any other failure (no answer, a 5xx, a 404,
+// a page that is not JSON) is that source's alone: its status, or -1, goes in
+// the record, and its keys are null. Each log line names the kind of failure
+// and the status of the page that answered, never the answer's text or where
+// it was redirected.
 async function readSource(pass: Pass, client: Pick<Client, 'get'>, url: string): Promise<SourceRead> {
   let answer: Answer;
   try {
@@ -646,6 +650,10 @@ async function readSource(pass: Pass, client: Pick<Client, 'get'>, url: string):
   } catch (error) {
     pass.say(`an account read failed (${error instanceof RequestError ? error.kind : 'network'})`);
     return { answer: { status: -1, body: undefined } };
+  }
+  if (answer.redirected === true) {
+    pass.say(`an account read was redirected (status ${answer.status}); the account reads stop and nothing is sent`);
+    return { stop: true };
   }
   const verdict = classify(answer);
   if (verdict === 'rate-limited' || verdict === 'challenge' || verdict === 'signed-out' || answer.status === 403) {

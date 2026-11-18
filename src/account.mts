@@ -192,11 +192,13 @@ export function hasUsableAnswer(answers: Readonly<Record<string, AccountAnswer>>
 }
 
 // The site's plan value: lowercase letters, digits, _, ., - and space, at
-// most 40 characters. A model slug, the same without _ or space. Neither
-// may hold an id, which both forms would let through: a run like a UUID's
-// first three groups, or 12 hex digits in a row.
+// most 40 characters. A model slug, the same without _ or space, and never
+// starting g-: the last model used can be a custom GPT, whose id (g- and 9
+// characters) has too few hex digits in a row for the id check below.
+// Neither may hold an id, which both forms would let through: a run like a
+// UUID's first three groups, or 12 hex digits in a row.
 const PLAN_FORM = /^[a-z0-9][a-z0-9_. -]{0,39}$/;
-const MODEL_FORM = /^[a-z0-9][a-z0-9.-]{0,39}$/;
+const MODEL_FORM = /^(?!g-)[a-z0-9][a-z0-9.-]{0,39}$/;
 const ID_LIKE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}|[0-9a-f]{12,}/i;
 const WORKSPACE_PLANS: ReadonlySet<string> = new Set(['team', 'enterprise', 'edu']);
 const MAX_COUNT = 1e6;

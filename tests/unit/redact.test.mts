@@ -65,7 +65,7 @@ async function walk(lists: Lists): Promise<{ items: ListItem[]; outcome: string;
     [`${API}/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=28`]: { items: [{ gizmo: { gizmo: { id: PROJECT_ID } } }], cursor: null },
     [`${API}/gizmos/${PROJECT_ID}/conversations?cursor=0`]: { items: lists.project ?? [], cursor: null },
   };
-  const client = { get: async (url: string): Promise<Answer> => ({ status: 200, headers: {}, text: JSON.stringify(pages[url] ?? { items: [] }) }) };
+  const client = { get: async (url: string): Promise<Answer> => ({ status: 200, headers: {}, text: JSON.stringify(pages[url] ?? { items: [] }), redirected: false }) };
   return walkLists(client, { start: null, end: null }, { crawlDelay: () => 0, sleep: async () => {} }, { log: () => {} });
 }
 async function listed(lists: Lists): Promise<ListItem[]> {

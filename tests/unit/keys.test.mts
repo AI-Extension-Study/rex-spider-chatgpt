@@ -75,7 +75,7 @@ async function walk(main: unknown[], project: unknown[]): Promise<Map<string, Li
     [`${API}/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0&limit=28`]: { items: [{ gizmo: { gizmo: { id: PROJECT } } }], cursor: null },
     [`${API}/gizmos/${PROJECT}/conversations?cursor=0`]: { items: project, cursor: null },
   };
-  const client = { get: async (url: string): Promise<Answer> => ({ status: 200, headers: {}, text: JSON.stringify(pages[url] ?? { items: [] }) }) };
+  const client = { get: async (url: string): Promise<Answer> => ({ status: 200, headers: {}, text: JSON.stringify(pages[url] ?? { items: [] }), redirected: false }) };
   const result = await walkLists(client, { start: null, end: null }, { crawlDelay: () => 0, sleep: async () => {} }, { log: () => {} });
   assert.equal(result.outcome, 'whole', result.reason);
   return new Map(result.items.map((item) => [item.id, item]));
