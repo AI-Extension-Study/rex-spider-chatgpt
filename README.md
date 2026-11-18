@@ -86,7 +86,7 @@ Each mode has its own upload key: the bare chat id in summary mode, the key earl
 
 Format 1 keeps the upload keys above. A later format n adds `-f<n>` to both: `<chat id>-f<n>` in summary mode and `<chat id>-detail-f<n>` in detail mode. So when the served format changes, no chat in the crawl window has a key under the new one, and the following passes send every chat in the window once, in the served mode, whenever it was last used: the 90-day limit of a mode switch does not apply. Within one format, a switch of mode works as above, on that format's keys only. The account record's hash includes `format_version`, so the first account read under a new format sends a record.
 
-A chat whose detail read failed before the change keeps its wait (see "When something fails"): the wait is kept per chat, not per format, and a read that fails again after it sends no summary in its place.
+The wait after a failed detail read (see "When something fails") is kept per format too, under `rex-spider-chatgpt-detail-memo-<chat id>` in format 1 and `...-f<n>` after. So a chat whose detail read failed before the change is read again at the first pass under the new format, and a read that fails then sends its summary in its place, under the new format.
 
 ## What is removed, and how
 

@@ -155,7 +155,7 @@ interface Pass {
   readonly hash: Hash;
   readonly records: Records;
   // The data format as served when the pass started: every record of the
-  // pass carries it, and every upload key it looks up or stamps is its
+  // pass carries it, and every upload key and memo it reads or writes is its
   // (keys.mts). One served during the pass applies from the next pass, as a
   // record and its key must agree.
   readonly format: number;
@@ -391,7 +391,7 @@ async function written(pass: Pass, write: Pending): Promise<boolean> {
   touch(pass.deps.keepAlive, pass.say);
   let kept: boolean;
   try {
-    kept = (await pass.deps.store.memo.set(write.chatId, write.memo)).ok;
+    kept = (await pass.deps.store.memo.set(write.chatId, write.memo, pass.format)).ok;
   } catch {
     kept = false;
   }
@@ -423,15 +423,16 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
     for (const item of due) {
       const at = uploadTime(item);
       touch(pass.deps.keepAlive, pass.say);
-      const memo = await store.memo.get(item.id);
+      const memo = await store.memo.get(item.id, pass.format);
       if (memo.unanswered) {
         pass.say('a detail memo got no answer; its chat is read in a later pass');
         held += 1;
         continue;
       }
-      // A memo of this list time holds its chat until its retry time, unless
-      // it was written under a clock that ran fast, which the mode record's
-      // start is not trusted after either (mode.mts).
+      // A memo of this list time, written under the pass's format, holds its
+      // chat until its retry time, unless it was written under a clock that
+      // ran fast, which the mode record's start is not trusted after either
+      // (mode.mts). One written under another format is not read.
       const earlier = memo.value !== null && memo.value.ended === at.timestamp() ? memo.value : null;
       if (earlier !== null && earlier.at <= pass.now() + CLOCK_SKEW_MS && pass.now() < earlier.at + earlier.retryMs) {
         held += 1;
@@ -463,7 +464,7 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
         inARow = 0;
         if (memo.value !== null || memo.malformed) {
           touch(pass.deps.keepAlive, pass.say);
-          if (!(await store.memo.clear(item.id)).ok) {
+          if (!(await store.memo.clear(item.id, pass.format)).ok) {
             pass.say('a detail memo was not cleared');
           }
         }

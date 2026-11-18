@@ -136,11 +136,20 @@ test('the mode record, the back-off, the account state and the memos sit under t
   assert.equal(MODE_KEY, 'rex-spider-chatgpt-mode');
   assert.equal(BACKOFF_KEY, 'rex-spider-chatgpt-backoff');
   assert.equal(ACCOUNT_KEY, 'rex-spider-chatgpt-account');
-  assert.equal(memoKey(CHAT), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+  assert.equal(memoKey(CHAT, 1), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+});
+
+test('a memo key, like an upload key id, keeps today\'s key under format 1 and adds -f and the format after', () => {
+  assert.equal(memoKey(CHAT, 1), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+  assert.equal(memoKey(CHAT, 2), `rex-spider-chatgpt-detail-memo-${CHAT}-f2`);
+  assert.equal(memoKey(CHAT, 999), `rex-spider-chatgpt-detail-memo-${CHAT}-f999`);
+  for (const format of [0, -1, 1.5, 1000, NaN, '2' as unknown as number, undefined as unknown as number]) {
+    assert.throws(() => memoKey(CHAT, format), TypeError, String(format));
+  }
 });
 
 test('a memo key needs a chat id', () => {
-  assert.throws(() => memoKey(''), TypeError);
+  assert.throws(() => memoKey('', 1), TypeError);
   assert.throws(() => uploadKeyId('', true, 1), TypeError);
 });
 
@@ -148,11 +157,12 @@ test('what may be logged of a key is its kind, never a chat id', () => {
   assert.equal(keyKind(MODE_KEY), 'rex-spider-chatgpt-mode');
   assert.equal(keyKind(BACKOFF_KEY), 'rex-spider-chatgpt-backoff');
   assert.equal(keyKind(ACCOUNT_KEY), 'rex-spider-chatgpt-account');
-  assert.equal(keyKind(memoKey(CHAT)), 'rex-spider-chatgpt-detail-memo');
+  assert.equal(keyKind(memoKey(CHAT, 1)), 'rex-spider-chatgpt-detail-memo');
+  assert.equal(keyKind(memoKey(CHAT, 2)), 'rex-spider-chatgpt-detail-memo');
   assert.equal(keyKind(`rex-spider-chatgpt-conversation-upload-${CHAT}-1788875383781`), 'other key');
 });
 
 test('a chat id that is not a string is refused at run time too', () => {
-  assert.throws(() => memoKey(123 as unknown as string), TypeError);
+  assert.throws(() => memoKey(123 as unknown as string, 1), TypeError);
   assert.throws(() => uploadKeyId(null as unknown as string, false, 1), TypeError);
 });

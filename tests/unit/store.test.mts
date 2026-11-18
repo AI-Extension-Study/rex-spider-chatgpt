@@ -92,7 +92,7 @@ test('a read that never gets an answer stays flagged through the mode and memo r
     }) as unknown as HandleMessage;
     const store = createStore(silent, { deadlineMs: 20, log: quiet });
     assert.deepEqual(await store.mode.get(), { value: null, unanswered: true, malformed: false }, `handled: ${handled}`);
-    assert.deepEqual(await store.memo.get(CHAT), { value: null, unanswered: true, malformed: false }, `handled: ${handled}`);
+    assert.deepEqual(await store.memo.get(CHAT, 1), { value: null, unanswered: true, malformed: false }, `handled: ${handled}`);
     asked.length = 0;
     assert.equal(await resendSince(store, 'detail', 1700000000000), null, `handled: ${handled}`);
     assert.deepEqual(asked, ['fetchValue rex-spider-chatgpt-mode'], `handled: ${handled}`);
@@ -138,13 +138,30 @@ test('a detail memo reads back as written, and clearing it writes null', async (
   const core = rexCore();
   const store = createStore(core.handleMessage, { log: quiet });
   const memo = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
-  await store.memo.set(CHAT, memo);
-  assert.deepEqual(await store.memo.get(CHAT), { value: memo, unanswered: false, malformed: false });
-  await store.memo.clear(CHAT);
-  assert.equal(core.values.get(memoKey(CHAT)), null);
-  assert.deepEqual(await store.memo.get(CHAT), { value: null, unanswered: false, malformed: false });
-  core.values.set(memoKey(OTHER_CHAT), { ended: 1, at: 1, retryMs: 0, failures: 1 });
-  assert.deepEqual(await store.memo.get(OTHER_CHAT), { value: null, unanswered: false, malformed: true });
+  await store.memo.set(CHAT, memo, 1);
+  assert.deepEqual(await store.memo.get(CHAT, 1), { value: memo, unanswered: false, malformed: false });
+  await store.memo.clear(CHAT, 1);
+  assert.equal(core.values.get(memoKey(CHAT, 1)), null);
+  assert.deepEqual(await store.memo.get(CHAT, 1), { value: null, unanswered: false, malformed: false });
+  core.values.set(memoKey(OTHER_CHAT, 1), { ended: 1, at: 1, retryMs: 0, failures: 1 });
+  assert.deepEqual(await store.memo.get(OTHER_CHAT, 1), { value: null, unanswered: false, malformed: true });
+});
+
+test('under format 2 a memo has a key of its own: the format 1 memo of the same chat is neither read nor written', async () => {
+  const core = rexCore();
+  const store = createStore(core.handleMessage, { log: quiet });
+  const formatOne = { ended: 1700000000000, at: 1700000100000, retryMs: 604_800_000, failures: 2 };
+  const formatTwo = { ended: 1700000000000, at: 1700000200000, retryMs: 86_400_000, failures: 1 };
+  core.values.set(`rex-spider-chatgpt-detail-memo-${CHAT}`, formatOne);
+  assert.deepEqual(await store.memo.get(CHAT, 2), { value: null, unanswered: false, malformed: false });
+  await store.memo.set(CHAT, formatTwo, 2);
+  assert.deepEqual(core.values.get(`rex-spider-chatgpt-detail-memo-${CHAT}-f2`), formatTwo);
+  assert.deepEqual(await store.memo.get(CHAT, 2), { value: formatTwo, unanswered: false, malformed: false });
+  await store.memo.clear(CHAT, 2);
+  assert.equal(core.values.get(`rex-spider-chatgpt-detail-memo-${CHAT}-f2`), null);
+  // The format 1 memo is as it was, and format 1 still reads it.
+  assert.deepEqual(core.values.get(`rex-spider-chatgpt-detail-memo-${CHAT}`), formatOne);
+  assert.deepEqual(await store.memo.get(CHAT, 1), { value: formatOne, unanswered: false, malformed: false });
 });
 
 test('the back-off reads back as written, clearing it writes null, and anything else stored there reads as absent and malformed', async () => {
@@ -187,9 +204,12 @@ test('a back-off that gets no answer is flagged, and counts as none', { timeout:
 test('log lines name a key\'s kind, never the chat id in it', { timeout: 2000 }, async () => {
   const lines: string[] = [];
   const store = createStore(rexCore({ open: false }).handleMessage, { deadlineMs: 20, log: (line) => lines.push(line) });
-  await store.memo.get(CHAT);
-  await store.memo.set(CHAT, { ended: 1, at: 1, retryMs: 1, failures: 1 });
-  assert.ok(lines.length >= 2, 'Test setup invalid: nothing was logged, so the absence below would mean nothing');
+  await store.memo.get(CHAT, 1);
+  await store.memo.set(CHAT, { ended: 1, at: 1, retryMs: 1, failures: 1 }, 1);
+  // A format 2 memo key carries the chat id too, then -f2.
+  await store.memo.get(CHAT, 2);
+  await store.memo.set(CHAT, { ended: 1, at: 1, retryMs: 1, failures: 1 }, 2);
+  assert.ok(lines.length >= 4, 'Test setup invalid: nothing was logged, so the absence below would mean nothing');
   assert.ok(lines.every((line) => !line.includes(CHAT)), lines.join('\n'));
   assert.ok(lines.every((line) => line.includes('rex-spider-chatgpt-detail-memo')), lines.join('\n'));
 });
@@ -245,8 +265,8 @@ test('memo fields of the wrong form, and arrays dressed as records, read as malf
   const store = createStore(core.handleMessage, { log: quiet });
   const good = { ended: 1700000000000, at: 1700000100000, retryMs: 86_400_000, failures: 1 };
   for (const bad of [{ ...good, failures: 0 }, { ...good, ended: -1 }, { ...good, at: 1.5 }, Object.assign([], good)]) {
-    core.values.set(memoKey(CHAT), bad);
-    assert.deepEqual(await store.memo.get(CHAT), { value: null, unanswered: false, malformed: true }, JSON.stringify(bad));
+    core.values.set(memoKey(CHAT, 1), bad);
+    assert.deepEqual(await store.memo.get(CHAT, 1), { value: null, unanswered: false, malformed: true }, JSON.stringify(bad));
   }
   core.values.set('rex-spider-chatgpt-mode', Object.assign([], { mode: 'summary', since: 1 }));
   assert.deepEqual(await store.mode.get(), { value: null, unanswered: false, malformed: true });
