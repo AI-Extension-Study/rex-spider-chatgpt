@@ -4,11 +4,13 @@ import { test } from 'node:test';
 import { sha256 } from '@bric/rex-core/common';
 import { DateString } from '@bric/rex-types/types';
 
+import { ACCOUNT_SOURCES, type AccountRecord, type AccountState, accountHash, accountSettings } from '../../src/account.mts';
 import { type Answer, RequestError } from '../../src/client.mts';
 import { PASS_LIMITS, type PassFramework, type PassLimits, type PassOutcome, runPass } from '../../src/pass.mts';
 import { type BackoffState } from '../../src/backoff.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
 import { type DetailMemo, type ModeRecord, type Read, type Write } from '../../src/store.mts';
+import { accountAnswers, memories } from './account-fixtures.mts';
 import { MARK, ROOT, T0, answer, detail, listItem, nodeId, projectItem, prompt, tree } from './fixtures.mts';
 
 type Json = Record<string, unknown>;
@@ -72,14 +74,23 @@ interface SiteOptions {
   readonly details?: Readonly<Record<string, Reply>>;
   // One request's answer by its label ('main 28', 'sidebar'), before any other.
   readonly answers?: Readonly<Record<string, Answer>>;
+  // An account source's answer by its name, or one per read of it (1 for
+  // the first); the fixtures' 200 unless a test gives another.
+  readonly account?: Readonly<Record<string, Reply>>;
 }
 
+// The account sources by URL, and their names in the order they are read.
+const ACCOUNT_URLS: ReadonlyMap<string, string> = new Map(ACCOUNT_SOURCES.map(([source, url]) => [url, source]));
+const SOURCES: readonly string[] = ACCOUNT_SOURCES.map(([source]) => source);
+
 // chatgpt.com as the pass reads it: the home page, the three conversation
-// lists by offset, the sidebar and each project's list, one page each, and
-// each chat's detail, its own unless a test gives another answer.
+// lists by offset, the sidebar and each project's list, one page each, each
+// chat's detail, its own unless a test gives another answer, and the four
+// account sources. Any other URL, /backend-api/me among them, throws.
 function site(options: SiteOptions = {}) {
   const requests: { readonly url: string; readonly token: string | undefined }[] = [];
   const reads: string[] = [];
+  const accountReads: string[] = [];
   const homes = { count: 0 };
   const answerTo = (url: string): Answer => {
     const given = options.answers?.[label(url)];
@@ -113,14 +124,23 @@ function site(options: SiteOptions = {}) {
       if (given === undefined) return json(chatDetail(id));
       return typeof given === 'function' ? given(reads.filter((each) => each === id).length) : given;
     }
+    const source = ACCOUNT_URLS.get(url);
+    if (source !== undefined) {
+      accountReads.push(source);
+      const given = options.account?.[source];
+      if (given === undefined) return json(accountAnswers()[source].body);
+      return typeof given === 'function' ? given(accountReads.filter((each) => each === source).length) : given;
+    }
     throw new Error('the pass asked for a page the site does not have');
   };
-  return { requests, reads, homes, answerTo };
+  return { requests, reads, accountReads, homes, answerTo };
 }
 
 // A short name for a request, for the order a test expects.
 function label(url: string): string {
   if (url === HOME) return 'home';
+  const source = ACCOUNT_URLS.get(url);
+  if (source !== undefined) return source;
   const parsed = new URL(url);
   if (parsed.pathname === '/backend-api/conversations') {
     const list = parsed.searchParams.get('is_archived') === 'true' ? 'archived' : parsed.searchParams.get('is_starred') === 'true' ? 'starred' : 'main';
@@ -151,6 +171,8 @@ interface SideOptions {
   readonly silentWindow?: boolean;
   // Called when the crawl window is looked up.
   readonly onWindow?: () => void;
+  // The served account block, as rex-spider merged it. Absent: off.
+  readonly account?: unknown;
 }
 
 // rex-spider's side as the pass sees it: the served flags, the crawl window,
@@ -162,6 +184,7 @@ function rexSpider(options: SideOptions = {}) {
   const lookups: string[] = [];
   const keyOfCall = (id: string, at: DateString) => `${id} ${Math.round(at.timestamp())}`;
   const framework: PassFramework = {
+    account: () => accountSettings(the(options.account, undefined)),
     isEnabled: () => the(options.enabled, true),
     justSummarize: () => the(options.summarize, false),
     continueAfterError: () => !the(options.halt, true),
@@ -198,12 +221,20 @@ interface CoreOptions {
   readonly memoUnkept?: boolean;
   readonly backoff?: BackoffState | null;
   readonly backoffUnanswered?: boolean;
+  // The account state, as store.mts reads it back: absent, unanswered, of
+  // the wrong form, or a read that rejects; and writes that are not kept.
+  readonly account?: AccountState | null;
+  readonly accountUnanswered?: boolean;
+  readonly accountMalformed?: boolean;
+  readonly accountRejects?: boolean;
+  readonly accountUnkept?: boolean;
 }
 
 // rex-core's store as the pass sees it (store.mts): the mode record, the
-// memos of failed detail reads, and the back-off.
+// memos of failed detail reads, the back-off and the account state.
 function rexCore(options: CoreOptions = {}) {
-  const held = { mode: options.mode ?? null, backoff: options.backoff ?? null };
+  const held = { mode: options.mode ?? null, backoff: options.backoff ?? null, account: options.account ?? null };
+  const accountWrites: AccountState[] = [];
   const writes: ModeRecord[] = [];
   const memos = new Map(Object.entries(options.memos ?? {}));
   const memoWrites: [string, DetailMemo][] = [];
@@ -217,6 +248,7 @@ function rexCore(options: CoreOptions = {}) {
     memoWrites,
     memoClears,
     backoffWrites,
+    accountWrites,
     store: {
       mode: {
         get: async (): Promise<Read<ModeRecord>> => {
@@ -254,6 +286,20 @@ function rexCore(options: CoreOptions = {}) {
         set: async (state: BackoffState | null): Promise<Write> => {
           backoffWrites.push(state);
           held.backoff = state;
+          return { ok: true, unanswered: false };
+        },
+      },
+      account: {
+        get: async (): Promise<Read<AccountState>> => {
+          if (options.accountRejects === true) throw new Error('the store failed');
+          if (options.accountUnanswered === true) return { value: null, unanswered: true, malformed: false };
+          if (options.accountMalformed === true) return { value: null, unanswered: false, malformed: true };
+          return { value: held.account, unanswered: false, malformed: false };
+        },
+        set: async (state: AccountState): Promise<Write> => {
+          accountWrites.push(state);
+          if (options.accountUnkept === true) return { ok: false, unanswered: false };
+          held.account = state;
           return { ok: true, unanswered: false };
         },
       },
@@ -358,14 +404,26 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
           return core.store.backoff.set(state);
         },
       },
+      account: {
+        get: () => {
+          trace.push('account get');
+          return core.store.account.get();
+        },
+        set: (state) => {
+          trace.push('account set');
+          return core.store.account.set(state);
+        },
+      },
     },
     dispatch: (record) => {
-      if (record.identifier === options.dispatchThrowsOn) throw new Error('the queue is full');
+      // An account record has no identifier, and is named by its name.
+      const what = record.name === 'rex-account' ? 'rex-account' : String(record.identifier);
+      if (what === options.dispatchThrowsOn) throw new Error('the queue is full');
       raw.push(record);
       const text = JSON.stringify(record);
       assert.equal(text.includes(MARK), false, 'text from the site reached an upload');
       sent.push(JSON.parse(text) as Json);
-      note(`dispatch ${String(record.identifier)}`);
+      note(`dispatch ${what}`);
     },
     sleep: options.sleep ?? (async (ms) => {
       note(`wait ${ms}`);
@@ -444,7 +502,7 @@ test('the detail pass reads each chat and sends format 1 records, stamped with -
 });
 
 // The calls that go to rex-core: the store adapter's and rex-spider's.
-const REX_CORE_CALL = /^(window|lookup |stamp |mode (get|set)|memo |clear |backoff (get|set))/;
+const REX_CORE_CALL = /^(window|lookup |stamp |mode (get|set)|memo |clear |backoff (get|set)|account (get|set))/;
 
 test('every call to rex-core is made just after a keep-alive call, since store calls do not reset the worker\'s idle timer', async () => {
   const side = rexSpider({ keys: [keyOf(2, 2, 'detail')] });
@@ -1100,4 +1158,284 @@ test('a back-off is not cleared by a pass whose list pages all failed without a 
   const run = await pass(site({ main: [listed(1, 1)], failing: { main: broken, archived: broken, starred: broken, sidebar: broken } }), rexSpider({ summarize: true }), { core });
   assert.equal(withoutMs(run.outcome.reason), 'list-failed');
   assert.deepEqual(core.backoffWrites, []);
+});
+
+// --- The account read ---
+
+const ACCOUNT_ON = { enabled: true };
+// The account reads as the events write them: a paced wait before each.
+const ACCOUNT_READS = SOURCES.flatMap((source) => ['wait 30000', `GET ${source}`]);
+const accountRequests = (events: readonly string[]): string[] => events.filter((event) => event.startsWith('GET ') && SOURCES.includes(event.slice('GET '.length))).map((event) => event.slice('GET '.length));
+const accountsOf = (sent: readonly Json[]): Json[] => sent.filter((record) => record.name === 'rex-account');
+const hashOfSent = (record: Json): Promise<string> => accountHash(record as unknown as AccountRecord);
+// The summary pass over one chat, as it runs with the account read off.
+const ONE_CHAT = ['GET home', 'wait 30000', ...LIST_WALK, `dispatch ${chat(1)}`, 'wait 3000', `stamp ${chat(1)}`];
+const allSources = (answer: Reply): Record<string, Reply> => Object.fromEntries(SOURCES.map((source) => [source, answer]));
+
+test('with the account read off, a pass makes the requests and waits it made before, and never touches the account state', async () => {
+  // interval_minutes with no enabled is off too.
+  for (const account of [undefined, { enabled: false }, { interval_minutes: 30 }, { enabled: 'true' }]) {
+    const web = site({ main: [listed(1, 1)] });
+    const run = await pass(web, rexSpider({ summarize: true, account }));
+    assert.deepEqual(run.events, ONE_CHAT, String(JSON.stringify(account)));
+    assert.deepEqual(web.accountReads, []);
+    assert.equal(run.trace.some((entry) => entry.startsWith('account ')), false);
+  }
+});
+
+test('served on with nothing stored, a pass reads the four account sources after the home page, each after a paced wait, sends one rex-account record and stores when', async () => {
+  const web = site({ main: [listed(1, 1)] });
+  const core = rexCore();
+  const run = await pass(web, rexSpider({ summarize: true, account: ACCOUNT_ON }), { core });
+  // The record is dispatched after the last read, and the state stored after
+  // the settle wait that follows it, before the wait ahead of the list walk.
+  assert.deepEqual(run.events, ['GET home', ...ACCOUNT_READS, 'dispatch rex-account', 'wait 3000', ...ONE_CHAT.slice(1)]);
+  assert.deepEqual(web.requests.slice(1, 5), ACCOUNT_SOURCES.map(([, url]) => ({ url, token: TOKEN })));
+  const settled = run.trace.indexOf('wait 3000');
+  assert.deepEqual(run.trace.slice(settled + 1, settled + 3), ['keep-alive', 'account set']);
+  const records = accountsOf(run.sent);
+  assert.equal(records.length, 1);
+  const [record] = records;
+  // Read when the last of the four answered: four waits after the pass started.
+  const readAt = NOW + 4 * 30_000;
+  assert.deepEqual([record.platform, record.format_version, record.date, record.plan, record.paid, record.workspace, record.history_saved], ['chatgpt', 1, readAt, 'free', false, 'personal', null]);
+  assert.deepEqual(record.source_status, { user_system_messages: 200, accounts_check: 200, settings_user: 200, memories: 200 });
+  assert.equal((record.metadata as Json).memories, 9);
+  assert.deepEqual(core.accountWrites, [{ hash: await hashOfSent(record), sentAt: readAt, readAt }]);
+  // The conversation pass is the one it would be without the account read.
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+  assert.deepEqual(run.sent.filter((each) => each.name === 'rex-conversation').map((each) => each.identifier), [chat(1)]);
+});
+
+test('the account is read again once the interval has passed, and a record goes out only when it changed or a day after the last one', async () => {
+  const core = rexCore();
+  const side = rexSpider({ summarize: true, account: ACCOUNT_ON });
+  // Waits take no time here, so each read is at its pass's start.
+  const at = async (minutes: number, options: SiteOptions = {}) => pass(site({ main: [listed(1, 1)], ...options }), side, { core, now: NOW + minutes * MINUTE, slept: () => 0 });
+  const first = await at(0);
+  const [sent] = accountsOf(first.sent);
+  const hash = await hashOfSent(sent);
+  assert.deepEqual(core.held.account, { hash, sentAt: NOW, readAt: NOW });
+
+  // 10 minutes on: no read, and nothing stored.
+  const soon = await at(10);
+  assert.deepEqual(accountRequests(soon.events), []);
+  assert.deepEqual(accountsOf(soon.sent), []);
+  assert.equal(core.accountWrites.length, 1);
+
+  // 61 minutes on, the same answers: read, nothing sent, the read time moves.
+  const later = await at(61);
+  assert.deepEqual(accountRequests(later.events), SOURCES);
+  assert.deepEqual(accountsOf(later.sent), []);
+  assert.deepEqual(core.held.account, { hash, sentAt: NOW, readAt: NOW + 61 * MINUTE });
+
+  // A saved memory more: sent.
+  const changed = await at(122, { account: { memories: json(memories(10)) } });
+  const [again] = accountsOf(changed.sent);
+  assert.equal((again.metadata as Json).memories, 10);
+  const changedHash = await hashOfSent(again);
+  assert.notEqual(changedHash, hash);
+  assert.deepEqual(core.held.account, { hash: changedHash, sentAt: NOW + 122 * MINUTE, readAt: NOW + 122 * MINUTE });
+
+  // Unchanged a little under a day later: read, not sent; a day after the
+  // last send: sent again.
+  const sameDay = await at(122 + 23 * 60, { account: { memories: json(memories(10)) } });
+  assert.deepEqual(accountsOf(sameDay.sent), []);
+  const nextDay = await at(122 + 24 * 60, { account: { memories: json(memories(10)) } });
+  assert.equal(accountsOf(nextDay.sent).length, 1);
+  assert.deepEqual(core.held.account, { hash: changedHash, sentAt: NOW + (122 + 24 * 60) * MINUTE, readAt: NOW + (122 + 24 * 60) * MINUTE });
+});
+
+test('a served interval_minutes sets how often the account is read', async () => {
+  const core = rexCore();
+  const side = rexSpider({ summarize: true, account: { enabled: true, interval_minutes: 15 } });
+  const at = async (minutes: number) => pass(site({ main: [listed(1, 1)] }), side, { core, now: NOW + minutes * MINUTE, slept: () => 0 });
+  await at(0);
+  assert.deepEqual(accountRequests((await at(14)).events), []);
+  assert.deepEqual(accountRequests((await at(15)).events), SOURCES);
+});
+
+test('a refused, rate-limited, challenged or signed-out account read stops the account reads and sends nothing; the pass, its reason and its back-off are as with the account off', async () => {
+  const stops: [string, Answer][] = [
+    ['429', failing(429)],
+    ['503', failing(503)],
+    ['a 200 with Retry-After', json({}, 200, { 'retry-after': '120' })],
+    ['a challenge', CHALLENGE],
+    ['401', failing(401)],
+    ['403', failing(403)],
+  ];
+  // A back-off that has run out, which a pass that reads a list page with no
+  // refusal clears: the account read must neither keep nor renew it.
+  const expired: BackoffState = { until: NOW - 1000, failures: 2, code: 'rate-limited' };
+  const offCore = rexCore({ backoff: expired });
+  const off = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { core: offCore, slept: () => 0 });
+  assert.deepEqual(offCore.backoffWrites, [null]);
+  for (const source of ['user_system_messages', 'settings_user']) {
+    for (const [what, answer] of stops) {
+      const name = `${what} on ${source}`;
+      const core = rexCore({ backoff: expired });
+      const run = await pass(site({ main: [listed(1, 1)], account: { [source]: answer } }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0 });
+      assert.deepEqual(accountRequests(run.events), SOURCES.slice(0, SOURCES.indexOf(source) + 1), name);
+      assert.deepEqual(accountsOf(run.sent), [], name);
+      assert.deepEqual(run.outcome, off.outcome, name);
+      assert.deepEqual(run.sent, off.sent, name);
+      assert.deepEqual(core.backoffWrites, offCore.backoffWrites, name);
+      // The read time is stored, so the next read waits out the interval.
+      assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }], name);
+    }
+  }
+  const limited = await pass(site({ main: [listed(1, 1)], account: { user_system_messages: failing(429) } }), rexSpider({ summarize: true, account: ACCOUNT_ON }));
+  assert.ok(limited.lines.includes('an account read was refused (rate-limited, status 429); the account reads stop and nothing is sent'), limited.lines.join('\n'));
+  const forbidden = await pass(site({ main: [listed(1, 1)], account: { user_system_messages: failing(403) } }), rexSpider({ summarize: true, account: ACCOUNT_ON }));
+  assert.ok(forbidden.lines.includes('an account read was refused (forbidden, status 403); the account reads stop and nothing is sent'), forbidden.lines.join('\n'));
+});
+
+test('a refusal keeps the hash and send time of the last record sent', async () => {
+  const stored: AccountState = { hash: 'b'.repeat(64), sentAt: NOW - 3 * DAY, readAt: NOW - 2 * 60 * MINUTE };
+  const core = rexCore({ account: stored });
+  await pass(site({ main: [listed(1, 1)], account: { accounts_check: failing(429) } }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0 });
+  assert.deepEqual(core.accountWrites, [{ ...stored, readAt: NOW }]);
+});
+
+test('an account source that fails otherwise is recorded by its status, or -1, and the other sources are still read', async () => {
+  const core = rexCore();
+  const web = site({
+    main: [listed(1, 1)],
+    account: {
+      user_system_messages: failing(500),
+      accounts_check: { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} one moment</html>` },
+      settings_user: () => { throw new RequestError('timeout'); },
+      memories: failing(404),
+    },
+  });
+  const run = await pass(web, rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0 });
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  // No source gave an answer to build from, so nothing is sent.
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+
+  // One that answers is enough: the record carries what it could read.
+  const one = await pass(site({
+    main: [listed(1, 1)],
+    account: { user_system_messages: failing(500), accounts_check: () => { throw new RequestError('network'); }, settings_user: failing(404) },
+  }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { slept: () => 0 });
+  const [record] = accountsOf(one.sent);
+  assert.deepEqual(record.source_status, { user_system_messages: 500, accounts_check: -1, settings_user: 404, memories: 200 });
+  assert.deepEqual([record.plan, record.training_allowed, record.web_search_enabled, record.metadata], [null, null, null, { memories: 9 }]);
+});
+
+test('all four sources answering 500 send nothing, and the read time is stored', async () => {
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1)], account: allSources(failing(500)) }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0 });
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.ok(run.lines.includes('the account reads gave no answer to build from; nothing is sent'), run.lines.join('\n'));
+});
+
+test('every account request comes just after a paced wait, and every account state call just after a keep-alive call', async () => {
+  const run = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }));
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  run.events.forEach((event, at) => {
+    if (accountRequests([event]).length > 0) assert.match(run.events[at - 1], /^wait /, `${event} came after ${run.events[at - 1]}`);
+  });
+  const calls = run.trace.flatMap((entry, at) => (REX_CORE_CALL.test(entry) ? [[entry, run.trace[at - 1]]] : []));
+  assert.ok(calls.some(([call]) => call === 'account get') && calls.some(([call]) => call === 'account set'));
+  for (const [call, before] of calls) {
+    assert.equal(before, 'keep-alive', `${call} came after ${before}`);
+  }
+});
+
+test('an account state that gets no answer skips the account read for the pass; one of the wrong form counts as none', async () => {
+  const silent = rexCore({ accountUnanswered: true });
+  const skipped = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core: silent });
+  assert.deepEqual(skipped.events, ONE_CHAT);
+  assert.deepEqual(silent.accountWrites, []);
+  assert.ok(skipped.lines.includes('the account state got no answer; the account is read in a later pass'));
+  const malformed = rexCore({ accountMalformed: true });
+  const read = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core: malformed });
+  assert.equal(accountsOf(read.sent).length, 1);
+  assert.equal(malformed.accountWrites.length, 1);
+});
+
+test('a switch-off during the account reads stops them before the next request, and the pass ends as switched off', async () => {
+  // Off once the first account source has been read.
+  const web = site({ main: [listed(1, 1)] });
+  const core = rexCore();
+  const run = await pass(web, rexSpider({ summarize: true, account: ACCOUNT_ON, enabled: () => web.accountReads.length === 0 }), { core, slept: () => 0 });
+  assert.deepEqual(run.events.filter((event) => event.startsWith('GET')), ['GET home', 'GET user_system_messages']);
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(run.outcome.reason), 'disabled stage=list');
+  // Off before the first account request: no request, and nothing stored.
+  const early = site({ main: [listed(1, 1)] });
+  const earlyCore = rexCore();
+  const before = await pass(early, rexSpider({ summarize: true, account: ACCOUNT_ON, enabled: () => early.requests.length === 0 }), { core: earlyCore });
+  assert.deepEqual(before.events.filter((event) => event.startsWith('GET')), ['GET home']);
+  assert.deepEqual(earlyCore.accountWrites, []);
+  assert.equal(withoutMs(before.outcome.reason), 'disabled stage=list');
+});
+
+test('an account read switched off while the sources are read sends nothing, and still stores the read time', async () => {
+  // The served account block is switched off during the last read.
+  const web = site({ main: [listed(1, 1)] });
+  const core = rexCore();
+  const run = await pass(web, rexSpider({ summarize: true, account: () => (web.accountReads.length < SOURCES.length ? ACCOUNT_ON : { enabled: false }) }), { core, slept: () => 0 });
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+  assert.ok(run.lines.includes('the account read was switched off before its record went out; nothing is sent'), run.lines.join('\n'));
+  // The spider is switched off during the last read.
+  const off = site({ main: [listed(1, 1)] });
+  const offCore = rexCore();
+  const stopped = await pass(off, rexSpider({ summarize: true, account: ACCOUNT_ON, enabled: () => off.accountReads.length < SOURCES.length }), { core: offCore, slept: () => 0 });
+  assert.deepEqual(accountRequests(stopped.events), SOURCES);
+  assert.deepEqual(accountsOf(stopped.sent), []);
+  assert.deepEqual(offCore.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(stopped.outcome.reason), 'disabled stage=list');
+});
+
+test('an account hook that throws anywhere leaves the pass as it is with the account off, and is logged by the error\'s name', async () => {
+  const off = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { slept: () => 0 });
+  const settingsThrow = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: () => { throw new TypeError('broken'); } }), { slept: () => 0 });
+  const stateRejects = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core: rexCore({ accountRejects: true }), slept: () => 0 });
+  for (const [run, line] of [[settingsThrow, 'the account read ended on an internal error (TypeError)'], [stateRejects, 'the account read ended on an internal error (Error)']] as const) {
+    assert.deepEqual(run.events, off.events);
+    assert.deepEqual(run.outcome, off.outcome);
+    assert.ok(run.lines.includes(line), run.lines.join('\n'));
+  }
+});
+
+test('a record that cannot be dispatched still stores the read time, keeps the last send, and the pass goes on', async () => {
+  const core = rexCore();
+  const run = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, dispatchThrowsOn: 'rex-account' });
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+  assert.ok(run.lines.includes('the account record was not sent (Error)'), run.lines.join('\n'));
+  // The next read, an interval on, sends it.
+  const next = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, now: NOW + 60 * MINUTE, slept: () => 0 });
+  assert.equal(accountsOf(next.sent).length, 1);
+});
+
+test('an account hash that never answers sends nothing, stores the read time, and the pass goes on', { timeout: 5000 }, async (t) => {
+  t.mock.method(crypto.subtle, 'digest', () => new Promise(() => {}));
+  const core = rexCore();
+  // No chat, so no other record needs a hash.
+  const run = await pass(site(), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0 });
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.match(run.outcome.reason, /^ok seen=0 dispatched=0 ms=\d+$/);
+});
+
+test('an account state that is not kept is logged, and the next pass reads the account again', async () => {
+  const core = rexCore({ accountUnkept: true });
+  const side = rexSpider({ summarize: true, account: ACCOUNT_ON });
+  const first = await pass(site({ main: [listed(1, 1)] }), side, { core, slept: () => 0 });
+  assert.ok(first.lines.includes('the account state was not kept'), first.lines.join('\n'));
+  const next = await pass(site({ main: [listed(1, 1)] }), side, { core, now: NOW + MINUTE, slept: () => 0 });
+  assert.deepEqual(accountRequests(next.events), SOURCES);
 });

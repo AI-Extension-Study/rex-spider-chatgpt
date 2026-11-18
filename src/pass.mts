@@ -1,10 +1,12 @@
 // One crawl pass: the access token from the home page, the list walk, and a
 // record for each chat in the crawl window that is not sent yet in the served
 // mode. Summary mode sends the list item; detail mode reads the chat first.
-// The requests, rex-spider's side, rex-core's store, the dispatch, the waits
-// and the clock are handed in, so the pass runs under the unit tests as it
-// does in the worker. It never throws: every outcome is a reason
-// (reasons.mts), and it never logs text, an id or the token.
+// Served on, the account read (readAccount) comes between the home page and
+// the list walk, and changes nothing else in the pass. The requests,
+// rex-spider's side, rex-core's store, the dispatch, the waits and the clock
+// are handed in, so the pass runs under the unit tests as it does in the
+// worker. It never throws: every outcome is a reason (reasons.mts), and it
+// never logs text, an id or the token.
 //
 // The failure policy. A 429, a 503, any Retry-After or a Cloudflare challenge
 // stops the pass and sets a back-off that outlives the worker (backoff.mts),
@@ -18,6 +20,9 @@
 // halt_on_error.
 import { type DateString } from '@bric/rex-types/types';
 
+import {
+  ACCOUNT_SOURCES, type AccountAnswer, type AccountSettings, type AccountState, accountDue, accountHash, buildChatGPTAccount, hasUsableAnswer, shouldSend,
+} from './account.mts';
 import { type BackoffCode, type BackoffState, backoffDecision, nextBackoff } from './backoff.mts';
 import { type Answer, type Classification, type Client, RequestError, classify, retryAfterMs } from './client.mts';
 import { HOME_URL, accessToken } from './home.mts';
@@ -31,10 +36,12 @@ import { type ChatGPTStore, type DetailMemo, type Mode } from './store.mts';
 
 // The rex-spider calls the pass makes on the spider. The flags are the
 // served config as of the last refresh, read where they apply: isEnabled
-// before every request, the served mode before each chat. The crawl window
-// and the upload keys go to rex-core, which never answers while its database
-// is not open, so each such call has a deadline.
+// before every request, the served mode before each chat, the served account
+// block (account.mts) once, when the account read would start. The crawl
+// window and the upload keys go to rex-core, which never answers while its
+// database is not open, so each such call has a deadline.
 export interface PassFramework {
+  account(): AccountSettings;
   isEnabled(): boolean;
   justSummarize(): boolean;
   continueAfterError(): boolean;
@@ -90,8 +97,9 @@ export interface PassDeps {
   readonly client: (token?: string) => Pick<Client, 'get'>;
   readonly framework: PassFramework;
   // rex-core's store, for the mode record (mode.mts), the back-off
-  // (backoff.mts) and the memos of failed detail reads.
-  readonly store: Pick<ChatGPTStore, 'mode' | 'backoff' | 'memo'>;
+  // (backoff.mts), the memos of failed detail reads and the account read's
+  // state (account.mts).
+  readonly store: Pick<ChatGPTStore, 'mode' | 'backoff' | 'memo' | 'account'>;
   readonly dispatch: (record: Record<string, unknown>) => void;
   // Every wait of the pass, in chunks of at most 20 s with a keep-alive call
   // before each (pacing.mts).
@@ -623,6 +631,132 @@ async function crawlWindow(pass: Pass): Promise<CrawlWindow | null> {
   }
 }
 
+// What one account source gave, or that the account reads stop.
+type SourceRead = { readonly answer: AccountAnswer } | { readonly stop: true };
+
+// One account source. A wait asked for, a challenge, a 401 or a 403 would
+// meet every source after it too, so it stops the reads. Any other failure
+// (no answer, a 5xx, a 404, a page that is not JSON) is that source's alone:
+// its status, or -1, goes in the record, and its keys are null. The log
+// names the kind of failure and the status, never the answer's text.
+async function readSource(pass: Pass, client: Pick<Client, 'get'>, url: string): Promise<SourceRead> {
+  let answer: Answer;
+  try {
+    answer = await client.get(url);
+  } catch (error) {
+    pass.say(`an account read failed (${error instanceof RequestError ? error.kind : 'network'})`);
+    return { answer: { status: -1, body: undefined } };
+  }
+  const verdict = classify(answer);
+  if (verdict === 'rate-limited' || verdict === 'challenge' || verdict === 'signed-out' || answer.status === 403) {
+    // A 403 with no challenge classifies as refused, which says nothing here.
+    pass.say(`an account read was refused (${verdict === 'refused' ? 'forbidden' : verdict}, status ${answer.status}); the account reads stop and nothing is sent`);
+    return { stop: true };
+  }
+  if (verdict !== 'ok') {
+    pass.say(`an account read failed (${verdict}, status ${answer.status})`);
+    return { answer: { status: answer.status, body: undefined } };
+  }
+  // classify has parsed the body as JSON, so the parse cannot throw.
+  return { answer: { status: answer.status, body: JSON.parse(answer.text) as unknown } };
+}
+
+// The record from the four answers, dispatched if it should go out, and the
+// state that says so; null when none went out.
+async function sendAccount(pass: Pass, answers: Readonly<Record<string, AccountAnswer>>, readAt: number, last: AccountState | null): Promise<AccountState | null> {
+  if (!hasUsableAnswer(answers)) {
+    pass.say('the account reads gave no answer to build from; nothing is sent');
+    return null;
+  }
+  try {
+    const record = buildChatGPTAccount(answers, readAt);
+    const hash = await withDeadline(accountHash(record), pass.limits.hashMs);
+    if (hash === TIMED_OUT) {
+      pass.say('the account record was not sent (the hash did not answer)');
+      return null;
+    }
+    if (!shouldSend(last, hash, readAt)) {
+      return null;
+    }
+    // The served flags as of now, since a refresh during the paced reads may
+    // have switched the account read, or the spider, off.
+    if (!pass.deps.framework.account().enabled || !pass.deps.framework.isEnabled()) {
+      pass.say('the account read was switched off before its record went out; nothing is sent');
+      return null;
+    }
+    // A shallow copy: the record's interface has no index signature.
+    pass.deps.dispatch({ ...record });
+    return { hash, sentAt: readAt, readAt };
+  } catch (error) {
+    pass.say(`the account record was not sent (${nameOf(error)})`);
+    return null;
+  }
+}
+
+// The account read, between the home page and the list walk: off unless
+// served on, and made only when due (account.mts). Each source is read
+// crawl_delay after the request before it, with the token. A record goes out
+// when a source gave an answer to build from, the record changed or the last
+// went out a day ago, and both the account read and the spider are still
+// switched on; the state that says so is stored after the settle
+// wait, so the record is stored first. The read time is stored after any
+// read, even one stopped or one whose record could not be built or sent, so
+// a lasting failure is read again only after the interval. It never throws,
+// and never touches the pass's refusal, pages read or reason: whatever the
+// account read meets, the pass goes on as if it were not there.
+async function readAccount(pass: Pass, client: Pick<Client, 'get'>): Promise<void> {
+  const { framework, store } = pass.deps;
+  try {
+    const settings = framework.account();
+    if (!settings.enabled) {
+      return;
+    }
+    touch(pass.deps.keepAlive, pass.say);
+    const stored = await store.account.get();
+    if (stored.unanswered) {
+      pass.say('the account state got no answer; the account is read in a later pass');
+      return;
+    }
+    if (!accountDue(stored.value, pass.now(), settings.intervalMinutes)) {
+      return;
+    }
+    const answers: Record<string, AccountAnswer> = {};
+    let made = 0;
+    let stopped = false;
+    for (const [source, url] of ACCOUNT_SOURCES) {
+      await pace(pass, crawlDelayMs(framework.fetchCrawlDelay()));
+      if (!framework.isEnabled()) {
+        pass.say('the spider was switched off during the account reads; nothing is sent');
+        stopped = true;
+        break;
+      }
+      made += 1;
+      const read = await readSource(pass, client, url);
+      if ('stop' in read) {
+        stopped = true;
+        break;
+      }
+      answers[source] = read.answer;
+    }
+    if (made === 0) {
+      return;
+    }
+    const readAt = pass.now();
+    let next: AccountState = { hash: stored.value?.hash ?? '', sentAt: stored.value?.sentAt ?? 0, readAt };
+    const sent = stopped ? null : await sendAccount(pass, answers, readAt, stored.value);
+    if (sent !== null) {
+      next = sent;
+      await pace(pass, pass.limits.settleMs);
+    }
+    touch(pass.deps.keepAlive, pass.say);
+    if (!(await store.account.set(next)).ok) {
+      pass.say('the account state was not kept');
+    }
+  } catch (error) {
+    pass.say(`the account read ended on an internal error (${nameOf(error)})`);
+  }
+}
+
 async function run(pass: Pass): Promise<PassOutcome> {
   const { deps } = pass;
   const { framework } = deps;
@@ -680,6 +814,7 @@ async function run(pass: Pass): Promise<PassOutcome> {
   }
   pass.stage = 'list';
   const client = deps.client(home.token);
+  await readAccount(pass, client);
   // crawl_delay between every two requests of the pass, the home page's too.
   await pace(pass, crawlDelayMs(framework.fetchCrawlDelay()));
   if (!framework.isEnabled()) {

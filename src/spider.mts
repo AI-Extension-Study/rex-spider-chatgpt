@@ -1,11 +1,12 @@
 // The spider rex-spider runs for ChatGPT: its name, the URLs the extension
-// lets it reach, the served mode and halt_on_error, and a crawl that is one
-// pass (src/pass.mts). src/service-worker.mts makes the instance and
-// registers it.
+// lets it reach, the served mode, halt_on_error and account block, and a
+// crawl that is one pass (src/pass.mts). src/service-worker.mts makes the
+// instance and registers it.
 import { sha256 } from '@bric/rex-core/common';
 import rexCorePlugin, { dispatchEvent } from '@bric/rex-core/service-worker';
 import { REXSpider, type REXSpiderCrawlResult } from '@bric/rex-spider/service-worker';
 
+import { ACCOUNT_SOURCES, type AccountSettings, accountSettings } from './account.mts';
 import { createClient } from './client.mts';
 import { HOME_URL, accessToken } from './home.mts';
 import { sleep } from './pacing.mts';
@@ -29,6 +30,10 @@ export class ChatGPTSpider extends REXSpider {
   // only ever turns off.
   haltsOnError = true;
 
+  // The account block as served on the last refresh: off unless it says
+  // enabled true (src/account.mts). A refresh without one turns it off.
+  accountServed: AccountSettings = accountSettings(undefined);
+
   // Whether a pass is running, set the moment a crawl starts. rex-spider's
   // own flag is set only once rex-core has stored the crawl's start, so a
   // second round could start a second pass before it, and two passes would
@@ -42,6 +47,13 @@ export class ChatGPTSpider extends REXSpider {
     super.updateConfiguration(configuration);
     this.summarizes = configuration.summarize === true;
     this.haltsOnError = configuration.halt_on_error !== false;
+    // rex-spider's configuration type has no account key, so the block is
+    // read as unknown and checked in src/account.mts.
+    this.accountServed = accountSettings('account' in configuration ? configuration.account : undefined);
+  }
+
+  account(): AccountSettings {
+    return this.accountServed;
   }
 
   justSummarize(): boolean {
@@ -82,7 +94,8 @@ export class ChatGPTSpider extends REXSpider {
   }
 
   // The requests a pass makes: the home page, the three conversation lists,
-  // the project sidebar and each project's list, and a chat's detail.
+  // the project sidebar and each project's list, a chat's detail, and the
+  // four account sources, each to the end of its path.
   allowedUrls(): string[] {
     return [
       '^https://chatgpt.com/$',
@@ -90,6 +103,7 @@ export class ChatGPTSpider extends REXSpider {
       '^https://chatgpt.com/backend-api/conversation/.*',
       '^https://chatgpt.com/backend-api/gizmos/.*/conversations\\?.*',
       '^https://chatgpt.com/backend-api/gizmos/snorlax/sidebar\\?.*',
+      ...ACCOUNT_SOURCES.map(([, url]) => `^${url}$`),
     ];
   }
 
@@ -126,7 +140,8 @@ export class ChatGPTSpider extends REXSpider {
       client: (token) => createClient({ token, keepAlive }),
       framework: this,
       store: createStore(rexCorePlugin.handleMessage),
-      // A shallow copy: rex-core's EventPayload has an index signature.
+      // A shallow copy: rex-core's EventPayload has an index signature. A
+      // record's own name (rex-account) comes after the default, so it stays.
       dispatch: (record) => dispatchEvent({ name: 'rex-conversation', ...record }),
       sleep: (ms) => sleep(ms, { keepAlive }),
       keepAlive,

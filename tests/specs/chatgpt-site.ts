@@ -4,9 +4,11 @@
 // context: the spider's requests leave the worker as they would in the
 // extension, and this answers them in place of the site. It serves what a pass
 // asks for (the home page with an access token, the three conversation lists,
-// the project sidebar and each project's list, and a chat's detail), built
-// from the unit tests' synthetic fixtures. Nothing here is a real chat: every
-// title and text carries MARK, which no record may hold.
+// the project sidebar and each project's list, a chat's detail, and the four
+// account sources), built from the unit tests' synthetic fixtures. Nothing
+// here is a real chat: every title and text carries MARK, which no record may
+// hold, and so does every account value the account record must not keep.
+import { accountAnswers } from '../unit/account-fixtures.mts'
 import {
   MARK, ROOT, T0, answer, attachment, detail, editedFirstPromptDetail, imagePart, listItem, nodeId, projectItem, prompt, reasoningDetail, tree,
 } from '../unit/fixtures.mts'
@@ -33,6 +35,13 @@ const LISTS = [
 const SIDEBAR = /^\/backend-api\/gizmos\/snorlax\/sidebar\?owned_only=true&conversations_per_gizmo=0&limit=28$/
 const PROJECT = /^\/backend-api\/gizmos\/([^/?]+)\/conversations\?cursor=0$/
 const DETAIL = /^\/backend-api\/conversation\/([^/?]+)$/
+// The account sources by path (no query), and the name each is written down by.
+const ACCOUNT = new Map([
+  ['/backend-api/user_system_messages', 'user_system_messages'],
+  ['/backend-api/accounts/check/v4-2023-04-27', 'accounts_check'],
+  ['/backend-api/settings/user', 'settings_user'],
+  ['/backend-api/memories', 'memories'],
+])
 
 // A list time as the lists write it: an ISO instant with microseconds and Z.
 export const listTime = (ms: number, micros = '123') => new Date(ms).toISOString().replace('Z', `${micros}Z`)
@@ -56,6 +65,8 @@ export class Site {
   refusals = new Map()
   // Awaited before a detail read is answered, with the chat id.
   beforeDetail = async () => {}
+  // What each account source answers, by its name: the fixtures' bodies.
+  account = Object.fromEntries(Object.entries(accountAnswers()).map(([source, answered]) => [source, answered.body]))
   // The access tokens the home page has handed out, and those the site has
   // since stopped taking. A request with no token, or one not taken, is
   // answered 401, as the API answers an expired session.
@@ -125,6 +136,10 @@ export class Site {
     if (chat !== null) {
       const id = decodeURIComponent(chat[1])
       return { line: `GET detail ${id}`, chat: id }
+    }
+    const source = ACCOUNT.get(path)
+    if (source !== undefined) {
+      return { line: `GET ${source}`, body: () => this.account[source] }
     }
     return null
   }

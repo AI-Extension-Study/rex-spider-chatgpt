@@ -26,8 +26,9 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 // The hash of a non-empty string, or null: for anything else, and when the
 // hash fails or answers with anything but a SHA-256 in lowercase hex, so a
-// hash wired wrong can never send the value itself.
-async function hashOf(value: unknown, hash: Hash): Promise<string | null> {
+// hash wired wrong can never send the value itself. account.mts hashes the
+// account record with it too.
+export async function hashOf(value: unknown, hash: Hash): Promise<string | null> {
   if (typeof value !== 'string' || value === '') {
     return null;
   }
