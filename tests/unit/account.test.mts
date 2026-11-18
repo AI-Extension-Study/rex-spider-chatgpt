@@ -82,6 +82,11 @@ test('a last read more than 5 minutes ahead of the clock means the clock went ba
   assert.equal(accountDue(readAt(NOW + 4 * MINUTE), NOW, 60), false);
 });
 
+test('an interval passed in out of range counts as 60 minutes', () => {
+  assert.equal(accountDue(readAt(NOW - 60 * MINUTE), NOW, 0), true);
+  assert.equal(accountDue(readAt(NOW - 59 * MINUTE), NOW, 0), false);
+});
+
 // --- shouldSend ---
 
 test('a record is sent when none was, when it changed, or when the last was sent a day ago', () => {
@@ -239,6 +244,32 @@ test('a text value where an enum belongs is null, or left out of metadata', () =
   assert.equal(build(answers).plan, 'plus');
 });
 
+test('a plan or a model slug that holds an id is null, or left out of metadata, though it fits the form', () => {
+  const answers = accountAnswers();
+  const slugs = at(settingsOf(answers), 'last_used_model_config', 'slugs');
+  // A UUID, a project id, a UUID's first three groups inside a longer value,
+  // and 12 hex digits in a row.
+  for (const [plan, model] of [
+    ['0b8e2c4a-1111-4a2b-8c3d-000000000001', 'g-p-0123456789abcdef'],
+    ['free-0b8e2c4a-1111-4a2b', 'gpt-0b8e2c4a-1111-4a2b'],
+    ['plus 0123456789ab', 'gpt-0123456789ab'],
+  ]) {
+    theAccount(answers).plan_type = plan;
+    slugs.web = model;
+    const record = build(answers);
+    assert.equal(record.plan, null, plan);
+    assert.equal('last_used_model' in record.metadata, false, model);
+  }
+  // Values the site sends, and 11 hex digits in a row, still pass.
+  for (const [plan, model] of [['free', 'gpt-5-3'], ['plus', 'gpt-4o'], ['pro_max 5x', 'o4-mini-high'], ['team', 'gpt-0123456789a']]) {
+    theAccount(answers).plan_type = plan;
+    slugs.web = model;
+    const record = build(answers);
+    assert.equal(record.plan, plan);
+    assert.equal(record.metadata.last_used_model, model);
+  }
+});
+
 test('the account is the first one not under default, wherever default comes', () => {
   const answers = accountAnswers();
   const accounts = at(answers.accounts_check.body, 'accounts');
@@ -369,6 +400,17 @@ test('a record has something to send only when a source answered 200 with an obj
   assert.equal(hasUsableAnswer(failed), true);
   // A key that is no source does not count.
   assert.equal(hasUsableAnswer({ me: { status: 200, body: {} } }), false);
+});
+
+test('answers that are no map count as no answer, and the builder gives the all-null record', () => {
+  for (const answers of [null, undefined, 'answers', 42, [accountAnswers().settings_user]]) {
+    const given = answers as unknown as Record<string, FixtureAnswer>;
+    assert.equal(hasUsableAnswer(given), false, JSON.stringify(answers));
+    const record = build(given);
+    assert.deepEqual(record.source_status, { user_system_messages: -1, accounts_check: -1, settings_user: -1, memories: -1 });
+    assert.deepEqual([record.plan, record.paid, record.workspace, record.training_allowed, record.account_created], [null, null, null, null, null]);
+    assert.deepEqual(record.metadata, {});
+  }
 });
 
 // --- accountHash ---

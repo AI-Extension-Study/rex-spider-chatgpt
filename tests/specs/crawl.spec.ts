@@ -79,6 +79,16 @@ async function crawl(serviceWorker) {
 }
 
 const records = (events) => events.filter((event) => event.name === 'rex-conversation')
+const accounts = (events) => events.filter((event) => event.name === 'rex-account')
+// The hash the account state keeps, made here as src/account.mts describes
+// it: SHA-256 of the record without date, as JSON with every object's keys
+// sorted.
+const canonical = (value) => {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
+  if (value !== null && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`
+  return JSON.stringify(value)
+}
+const accountHashOf = ({ date, ...record }) => sha256(canonical(record))
 const completions = (events) => events
   .filter((event) => event.event_name === 'rex-spider-chatgpt-complete')
   .map(({ event_details: details }) => [details.crawled_count, details.crawled_ids, details.reason])
@@ -199,6 +209,51 @@ test('served summarize, a crawl sends a summary per chat, newest first, keyed as
   expect(site.calls).toEqual(listWalk({ projects: [PROJECT] }))
   expect(records(second.events)).toEqual([])
   expect(completions(second.events)).toEqual([[0, [chat(1), chat(2), chat(3)], reason('ok seen=3 dispatched=0')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
+// The account read is off unless served on (every other spec here serves no
+// account block, and the site answers the account sources, so their exact
+// request lists show that). Served on, a crawl reads the four sources after
+// the home page and before the lists, sends one rex-account record and stores
+// when; the next crawl, inside the interval, reads none.
+test('served account enabled, a crawl reads the four account sources and sends one rex-account record; the next crawl reads none, and every request is an allowed URL', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(60_000)
+  const site = new Site()
+  site.main.push(mainItem(chat(1), Date.now() - HOUR_MS))
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker, { summarize: true, account: { enabled: true } })
+
+  const before = Date.now()
+  const first = await crawl(serviceWorker)
+  const after = Date.now()
+  expect(site.calls.splice(0)).toEqual(['GET home', 'GET user_system_messages', 'GET accounts_check', 'GET settings_user', 'GET memories', ...listWalk().slice(1)])
+  const sent = accounts(first.events)
+  expect(sent).toHaveLength(1)
+  const [record] = sent
+  expect(record).toMatchObject({
+    name: 'rex-account', platform: 'chatgpt', format_version: 1, plan: 'free', paid: false, workspace: 'personal', web_search_enabled: true,
+    training_allowed: true, history_saved: null, memory_enabled: true, custom_instructions_set: false,
+    source_status: { user_system_messages: 200, accounts_check: 200, settings_user: 200, memories: 200 },
+  })
+  expect(record.metadata.memories).toEqual(9)
+  expect(record.date).toBeGreaterThanOrEqual(before)
+  expect(record.date).toBeLessThanOrEqual(after)
+  expect(records(first.events).map((each) => each.identifier)).toEqual([chat(1)])
+  expect(completions(first.events)).toEqual([[1, [chat(1)], reason('ok seen=1 dispatched=1')]])
+  // The worker's Web Crypto hash is the one Node makes of the record.
+  const state = await storedValue(serviceWorker, 'rex-spider-chatgpt-account')
+  expect(state).toEqual({ hash: accountHashOf(record), sentAt: record.date, readAt: record.date })
+
+  const second = await crawl(serviceWorker)
+  expect(site.calls).toEqual(listWalk())
+  expect(accounts(second.events)).toEqual([])
+  expect(completions(second.events)).toEqual([[0, [chat(1)], reason('ok seen=1 dispatched=0')]])
+  expect(await storedValue(serviceWorker, 'rex-spider-chatgpt-account')).toEqual(state)
+
+  const allowed = await serviceWorker.evaluate(() => self.rexChatGPTPlugin.allowedUrls())
+  expect(site.urls.filter((url) => !allowed.some((pattern) => new RegExp(pattern).test(url)))).toEqual([])
   await expectAllRouted(serviceWorker, site, unrouted)
 })
 

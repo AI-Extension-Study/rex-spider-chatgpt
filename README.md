@@ -1,6 +1,6 @@
 # rex-spider-chatgpt
 
-The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the Gemini fork also uses.
+The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the Gemini fork also uses. Where the served configuration turns it on, it also sends a `rex-account` record of the account's plan and settings (see "The account record").
 
 **Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension installs this fork at `74712d8` from its release v0.0.59 (2026-11-13) on.
 
@@ -19,10 +19,11 @@ Never collected: titles (only the hash), message text (only the counts), thinkin
 The extension starts a crawl round every minute, but only while an ID is stored and only when its configuration request gets an HTTP answer. rex-spider starts a ChatGPT pass when none is running and `sleep_delay` has passed since the last one.
 
 1. Read `https://chatgpt.com/` for the access token the site's own page carries.
-2. Walk the chat lists, `crawl_delay` between any two requests: the main list (`/backend-api/conversations`, 28 chats a page, newest change first, archived and starred chats left out), the same list for archived chats and for starred chats, the project sidebar, and each project's list. A chat list stops at an empty page or a page with no chat in the crawl window. A chat on several lists counts once.
-3. Check each chat in the window against the upload keys (see "Modes and the re-send"). The chats not sent yet go out newest change first.
-4. Summary mode builds each record from the list item. Detail mode reads the chat (`/backend-api/conversation/<id>`), one read per `crawl_delay` and never closer than 3 s, and builds the record from that.
-5. Send one completion event (see "Reading the completion events").
+2. If the account read is on and due, read the four account sources with that token and send the account record if it changed (see "The account record").
+3. Walk the chat lists, `crawl_delay` between any two requests: the main list (`/backend-api/conversations`, 28 chats a page, newest change first, archived and starred chats left out), the same list for archived chats and for starred chats, the project sidebar, and each project's list. A chat list stops at an empty page or a page with no chat in the crawl window. A chat on several lists counts once.
+4. Check each chat in the window against the upload keys (see "Modes and the re-send"). The chats not sent yet go out newest change first.
+5. Summary mode builds each record from the list item. Detail mode reads the chat (`/backend-api/conversation/<id>`), one read per `crawl_delay` and never closer than 3 s, and builds the record from that.
+6. Send one completion event (see "Reading the completion events").
 
 Detail reads stop once a pass has spent 360 s reading (requests, parsing and storage calls; the waits do not count), counted from its first detail read. Chats not reached keep no key and go out in a later pass. Waits run in steps of at most 20 s with a cheap extension call before each, so Chrome does not stop the service worker mid-pass, and every request gives up after 20 s. A list is cut after 1,000 pages, or after 3 pages in a row with no new chat; a pass makes at most 5,000 list requests.
 
@@ -49,6 +50,29 @@ A turn is one prompt or one reply. A reply folds every visible assistant message
 | `model_slug`, `nodes` | extras on a reply: its last message's model, and how many messages it folds |
 
 A count is null when what it is made from is missing or has another form, so a change on ChatGPT's side shows as nulls, not zeros. `turns_complete` is false when a message could not be read, a link names a message the tree does not hold, part of the tree hangs from no root, or the turns were cut to the newest 1,000 or to 512 KB of JSON. `mapping` is never cut.
+
+## The account record
+
+Off unless the served configuration has `account: {"enabled": true}` for this spider. When on, a pass reads four sources right after the home page, `crawl_delay` before each, and sends one `rex-account` point:
+
+| source | URL (`https://chatgpt.com/backend-api/...`) | keys it fills |
+|---|---|---|
+| `user_system_messages` | `user_system_messages` | `web_search_enabled` (`browser` not among `disabled_tools`), `custom_instructions_set` |
+| `accounts_check` | `accounts/check/v4-2023-04-27` | `plan` (`plan_type`), `paid`, `workspace`, `account_created`; metadata `is_trial`, `cancels_at`, `renews_at`, `will_renew` |
+| `settings_user` | `settings/user` | `training_allowed`, `memory_enabled` (`m3m`); metadata `hive_referenced_in_internal_knowledge`, `connector_search_enabled`, `free_ads_opt_out`, `last_used_model` |
+| `memories` | `memories` | metadata `memories`, the number of saved memories |
+
+`/backend-api/me` is never requested: it holds the email, the name and the phone number.
+
+Every record has, in this order: `name` (`rex-account`), `platform` (`chatgpt`), `format_version` (`1`), `date` (the read, epoch ms), `plan`, `paid`, `workspace` (`personal`, `team`, `enterprise` or `edu`), `web_search_enabled`, `training_allowed`, `history_saved` (always null: ChatGPT has no such setting), `memory_enabled`, `custom_instructions_set`, `account_created`, `source_status` (each source's HTTP status, -1 for no answer) and `metadata`. A key is null when its source did not answer 200 with JSON, the site has no such key, or the value has the wrong form. `plan` must match `^[a-z0-9][a-z0-9_. -]{0,39}$` and `last_used_model` `^[a-z0-9][a-z0-9.-]{0,39}$`, and neither may hold a UUID-like run or 12 hex digits in a row. Times are ISO 8601 instants in UTC ending in `Z`. A metadata value of the wrong form is left out; `cancels_at` and `renews_at` keep the site's null.
+
+Never in the record: emails, names, phone numbers, ids of any kind (account, user, subscription, organization), organization names, billing details, the text of custom instructions or memories (only whether any instruction is written, and how many memories), and the home page line the token comes from. `src/redact.mts` and `src/keep.mts` cover `rex-conversation` records only; the extension checks a `rex-account` record against its own allow-list.
+
+**When it is read.** When no read is stored, once `interval_minutes` (default 60) have passed since the last, or when the stored read time is more than 5 minutes ahead of the clock (the clock went back).
+
+**When it is sent.** When nothing was sent before, when the record differs from the last one sent (SHA-256 of the record without `date`, keys sorted), or a day after the last send, so a day with no record means the account could not be read. The read time, and the hash and time of the last send, are stored under `rex-spider-chatgpt-account`, 3 s after a dispatch so the record is stored first.
+
+**When a read fails.** A 429, a 503, a `Retry-After` header, a challenge, a 401 or a 403 on any source stops the account reads, and nothing is sent. Any other failure of one source (a 5xx, a 404, a page that is not JSON, no answer) leaves that source's keys null, and the other sources are still read; a record goes out only if at least one source answered 200 with JSON. Either way the read time is stored, so the next read waits out the interval. The account read never sets the back-off, never changes a completion event, and never stops the conversation pass; an error in it is logged by the error's name and the pass goes on.
 
 ## Modes and the re-send
 
@@ -99,6 +123,7 @@ rex-spider merges `spider.spiders.chatgpt` over `spider.spiders.default` from th
 | `crawl_delay` | `30000` | ms between requests; any value that does not read as a number of 0 or more counts as 30000 |
 | `sleep_delay` | `300000` | ms between passes, applied by rex-spider |
 | `start`, `end`, `time_anchor` | none, none, `runtime` | the crawl window: `start` and `end` in ms from the install time (`install`) or from now (`runtime`), or as epoch ms (`absolute`); a chat is in it by its list `update_time` |
+| `account` | absent (off) | `{"enabled": true}` turns the account read on; `interval_minutes`, an integer from 15 to 1440 (else 60), is the time between reads. A `chatgpt` block's `account` replaces the `default` block's whole |
 
 ## What it cannot see
 
@@ -121,6 +146,7 @@ The extension installs this module from a pinned commit and carries a copy of `s
 | see how a record is built | `src/record.mts`, then `src/detail.mts` for turns and `src/counts.mts` for the counts |
 | see what the redactor keeps | `src/keep.mts`, then `src/redact.mts` |
 | follow one pass | `src/pass.mts`, then `src/list.mts` |
+| see how the account record is built, and when it is sent | `src/account.mts`, then `readAccount` in `src/pass.mts` |
 | decode a completion reason | `src/reasons.mts` |
 
 ## What is in this repo
@@ -134,4 +160,4 @@ The extension installs this module from a pinned commit and carries a copy of `s
 
 ## Keeping this current
 
-A pull request that changes what a record holds, what is removed, which lists are read, the pace, the reasons or the settings updates this README in the same pull request.
+A pull request that changes what a record holds, what is removed, which lists or account sources are read, the pace, the reasons or the settings updates this README in the same pull request.

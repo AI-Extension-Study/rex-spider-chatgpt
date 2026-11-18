@@ -28,6 +28,10 @@ export const MODE_KEY = `${KEY_PREFIX}mode`;
 // (backoff.mts, BackoffState).
 export const BACKOFF_KEY = `${KEY_PREFIX}backoff`;
 
+// The account read's state: the last read, and the hash and time of the
+// last record sent (account.mts, AccountState).
+export const ACCOUNT_KEY = `${KEY_PREFIX}account`;
+
 const MEMO_PREFIX = `${KEY_PREFIX}detail-memo-`;
 
 // One chat's memo of a failed detail read (store.mts, DetailMemo).
@@ -38,7 +42,7 @@ export function memoKey(chatId: string): string {
 // The part of a key that may be logged: its kind. A memo key carries a chat
 // id, and a key this module does not own is not echoed at all.
 export function keyKind(key: string): string {
-  if (key === MODE_KEY || key === BACKOFF_KEY) {
+  if (key === MODE_KEY || key === BACKOFF_KEY || key === ACCOUNT_KEY) {
     return key;
   }
   if (key.startsWith(MEMO_PREFIX)) {

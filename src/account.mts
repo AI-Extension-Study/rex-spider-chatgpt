@@ -167,7 +167,8 @@ export async function accountHash(record: AccountRecord): Promise<string> {
 
 const NO_ANSWER = -1;
 
-const answerOf = (answers: Readonly<Record<string, AccountAnswer>>, source: string): AccountAnswer | undefined => (Object.hasOwn(answers, source) ? answers[source] : undefined);
+// A source's answer. Answers that are no map (null, a list) hold none.
+const answerOf = (answers: Readonly<Record<string, AccountAnswer>>, source: string): AccountAnswer | undefined => (isObject(answers) && Object.hasOwn(answers, source) ? answers[source] : undefined);
 
 // An HTTP status, or -1 for anything else (no answer, a timeout, a status a
 // fetch never gives).
@@ -191,14 +192,17 @@ export function hasUsableAnswer(answers: Readonly<Record<string, AccountAnswer>>
 }
 
 // The site's plan value: lowercase letters, digits, _, ., - and space, at
-// most 40 characters. A model slug, the same without _ or space.
+// most 40 characters. A model slug, the same without _ or space. Neither
+// may hold an id, which both forms would let through: a run like a UUID's
+// first three groups, or 12 hex digits in a row.
 const PLAN_FORM = /^[a-z0-9][a-z0-9_. -]{0,39}$/;
 const MODEL_FORM = /^[a-z0-9][a-z0-9.-]{0,39}$/;
+const ID_LIKE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}|[0-9a-f]{12,}/i;
 const WORKSPACE_PLANS: ReadonlySet<string> = new Set(['team', 'enterprise', 'edu']);
 const MAX_COUNT = 1e6;
 
 const flag = (value: unknown): boolean | null => (typeof value === 'boolean' ? value : null);
-const formed = (value: unknown, form: RegExp): string | null => (typeof value === 'string' && form.test(value) ? value : null);
+const formed = (value: unknown, form: RegExp): string | null => (typeof value === 'string' && form.test(value) && !ID_LIKE.test(value) ? value : null);
 
 // An ISO 8601 instant: a date, a time, and Z or an offset. Checked by shape,
 // then by Temporal, which refuses a shape that names no instant (30
@@ -216,7 +220,7 @@ const INSTANT = (new DateString('1970-01-01T00:00:00Z').value as object).constru
 // writes a time the same way whatever offset the site used. Null for
 // anything else, and for an offset that carries the year past 9999, which
 // Temporal writes +010000-...
-function instantOf(value: unknown): string | null {
+function utcInstant(value: unknown): string | null {
   if (typeof value !== 'string' || !ISO_INSTANT.test(value)) {
     return null;
   }
@@ -280,7 +284,7 @@ function webSearch(body: Readonly<Record<string, unknown>> | undefined): boolean
 const asFlag = (value: unknown): boolean | undefined => flag(value) ?? undefined;
 const asModel = (value: unknown): string | undefined => formed(value, MODEL_FORM) ?? undefined;
 const asCount = (value: unknown): number | undefined => (Array.isArray(value) && value.length <= MAX_COUNT ? value.length : undefined);
-const asTime = (value: unknown): string | null | undefined => (value === null ? null : instantOf(value) ?? undefined);
+const asTime = (value: unknown): string | null | undefined => (value === null ? null : utcInstant(value) ?? undefined);
 
 export function buildChatGPTAccount(answers: Readonly<Record<string, AccountAnswer>>, now: number): AccountRecord {
   const system = bodyOf(answers, 'user_system_messages');
@@ -324,7 +328,7 @@ export function buildChatGPTAccount(answers: Readonly<Record<string, AccountAnsw
     history_saved: null,
     memory_enabled: flag(field(settings, 'm3m')),
     custom_instructions_set: instructionsSet(system),
-    account_created: instantOf(field(account, 'created_time')),
+    account_created: utcInstant(field(account, 'created_time')),
     source_status: sourceStatus,
     metadata,
   };

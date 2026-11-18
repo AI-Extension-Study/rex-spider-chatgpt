@@ -7,6 +7,7 @@
 // inside the worker, so one log holds its requests and keep-alive calls in
 // order; crawl.spec.ts runs the crawls with chatgpt.com answered by a route.
 import { test, expect } from './fixtures'
+import { accountAnswers } from '../unit/account-fixtures.mts'
 
 test('the module registers one ChatGPT spider with rex-spider', async ({ serviceWorker }) => {
   const seen = await serviceWorker.evaluate(() => {
@@ -54,6 +55,48 @@ test('the same holds through rex-spider\'s own refresh, which merges the default
   expect(seen).toEqual([[true, true], [false, true], [false, true], [false, false]])
 })
 
+test('the account setting takes effect both ways on every configuration update, and a spider\'s own account block replaces the default\'s whole', async ({ serviceWorker }) => {
+  const seen = await serviceWorker.evaluate(() => {
+    const spider = self.rexChatGPTPlugin
+    const direct = []
+    for (const configuration of [{ account: { enabled: true } }, { account: { enabled: true, interval_minutes: 30 } }, {}, { account: { interval_minutes: 30 } }]) {
+      spider.updateConfiguration(configuration)
+      direct.push(spider.account())
+    }
+    const refreshed = []
+    for (const spiders of [
+      { default: { account: { enabled: true } } },
+      { default: { account: { enabled: true } }, chatgpt: { enabled: true, account: { interval_minutes: 120 } } },
+      { default: { account: { enabled: true, interval_minutes: 20 } }, chatgpt: { enabled: true } },
+    ]) {
+      self.rexSpiderPlugin.updateConfiguration({ spiders })
+      refreshed.push(spider.account())
+    }
+    return { direct, refreshed }
+  })
+  expect(seen).toEqual({
+    direct: [{ enabled: true, intervalMinutes: 60 }, { enabled: true, intervalMinutes: 30 }, { enabled: false, intervalMinutes: 60 }, { enabled: false, intervalMinutes: 30 }],
+    refreshed: [{ enabled: true, intervalMinutes: 60 }, { enabled: false, intervalMinutes: 120 }, { enabled: true, intervalMinutes: 20 }],
+  })
+})
+
+// The four account reads, as the spider's allowed URLs name them.
+const ACCOUNT_PATTERNS = [
+  '^https://chatgpt.com/backend-api/user_system_messages$',
+  '^https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27$',
+  '^https://chatgpt.com/backend-api/settings/user$',
+  '^https://chatgpt.com/backend-api/memories$',
+]
+
+test('the allowed URLs hold each account read to the end of its path, and none of them allows /backend-api/me', async ({ serviceWorker }) => {
+  const allowed = await serviceWorker.evaluate(() => self.rexChatGPTPlugin.allowedUrls())
+  const allowing = (url) => allowed.filter((pattern) => new RegExp(pattern).test(url))
+  for (const pattern of ACCOUNT_PATTERNS) expect(allowed).toContain(pattern)
+  for (const url of ['https://chatgpt.com/backend-api/me', 'https://chatgpt.com/backend-api/me?x=1', 'https://chatgpt.com/backend-api/memories/1', 'https://chatgpt.com/backend-api/settings/user/x']) {
+    expect(allowing(url), url).toEqual([])
+  }
+})
+
 test('the keys the spider writes sit under the namespace rex-spider gives its identifier', async ({ serviceWorker }) => {
   const seen = await serviceWorker.evaluate(() => ({ prefix: self.rexChatGPTKeyPrefix, identifier: self.rexChatGPTPlugin.identifier() }))
   expect(seen.prefix).toEqual(`rex-spider-${seen.identifier}-`)
@@ -92,14 +135,23 @@ async function untilStoreOpen(serviceWorker) {
 // chatgpt.com for one pass, answered inside the worker: fetch is replaced for
 // that host only, and so is the keep-alive read, so one log holds both in the
 // order the worker made them. Each request is written down by what it asked
-// for. The chat and its title are made up, and its text carries MARKER.
+// for. The chat and its title are made up, and its text carries MARKER, as
+// does every value of the account answers the record must not keep.
 const CHAT = '6911f0a5-2222-8000-8000-0000000000aa'
 const TITLE = 'MARKER title of the chat'
 const T0 = 1794319205
+const ACCOUNT_PATHS = {
+  '/backend-api/user_system_messages': 'user_system_messages',
+  '/backend-api/accounts/check/v4-2023-04-27': 'accounts_check',
+  '/backend-api/settings/user': 'settings_user',
+  '/backend-api/memories': 'memories',
+}
 
 async function onePass(serviceWorker, served) {
   await untilStoreOpen(serviceWorker)
-  return serviceWorker.evaluate(async ({ chat, title, t0, served }) => {
+  const answers = accountAnswers()
+  const account = Object.fromEntries(Object.entries(ACCOUNT_PATHS).map(([path, source]) => [path, answers[source].body]))
+  return serviceWorker.evaluate(async ({ chat, title, t0, served, account }) => {
     const message = (id, role, seconds, text, extra = {}) => ({
       id, author: { role, name: null, metadata: {} }, create_time: seconds, update_time: null, content: { content_type: 'text', parts: [text] },
       status: 'finished_successfully', end_turn: role === 'assistant' ? true : null, weight: 1, recipient: 'all', channel: role === 'assistant' ? 'final' : null, ...extra,
@@ -135,6 +187,7 @@ async function onePass(serviceWorker, served) {
         return json({ items: [], cursor: null })
       }
       log.push(`GET ${url.pathname}`)
+      if (url.pathname in account) return json(account[url.pathname])
       return url.pathname === `/backend-api/conversation/${chat}` ? json(detail) : new Response('', { status: 404 })
     }
     const local = chrome.storage.local
@@ -154,9 +207,10 @@ async function onePass(serviceWorker, served) {
     return {
       log,
       records: events.filter((event) => event.name === 'rex-conversation'),
+      accounts: events.filter((event) => event.name === 'rex-account'),
       completions: events.filter((event) => event.event_name === 'rex-spider-chatgpt-complete').map((event) => event.event_details),
     }
-  }, { chat: CHAT, title: TITLE, t0: T0, served })
+  }, { chat: CHAT, title: TITLE, t0: T0, served, account })
 }
 
 // SHA-256 of TITLE in hex.
@@ -178,6 +232,32 @@ test('a crawl is one pass: paced waits with a keep-alive call, rex-core\'s SHA-2
   expect(record.turns.map((turn) => turn.speaker)).toEqual(['user', 'assistant'])
   expect(record.metadata.title_hash).toEqual(TITLE_HASH)
   expect(Object.keys(record.metadata.mapping).sort()).toEqual(['client-created-root', 'node-1', 'node-2'])
+  expect(completions.at(-1)).toMatchObject({ crawled_count: 1, crawled_ids: [CHAT] })
+  expect(completions.at(-1).reason).toMatch(/^ok seen=1 dispatched=1 ms=\d+$/)
+})
+
+test('served account enabled, a crawl reads the four account sources after the home page, each after a paced wait, and sends one rex-account record', async ({ serviceWorker }) => {
+  const { log, records, accounts, completions } = await onePass(serviceWorker, { summarize: false, account: { enabled: true } })
+  const requests = log.filter((entry) => entry.startsWith('GET'))
+  const reads = Object.keys(ACCOUNT_PATHS).map((path) => `GET ${path}`)
+  expect(requests).toEqual(['GET home', ...reads, 'GET main 0', 'GET main 28', 'GET archived 0', 'GET starred 0', 'GET sidebar', `GET /backend-api/conversation/${CHAT}`])
+  // Between two account reads: the paced wait's keep-alive call and the request's own.
+  for (let n = 1; n < reads.length; n += 1) {
+    expect(log.slice(log.indexOf(reads[n - 1]) + 1, log.indexOf(reads[n]))).toEqual(['keep-alive', 'keep-alive'])
+  }
+  expect(accounts).toHaveLength(1)
+  const [account] = accounts
+  expect(JSON.stringify(account)).not.toContain('MARKER')
+  expect(Object.keys(account)).toEqual([
+    'name', 'platform', 'format_version', 'date', 'plan', 'paid', 'workspace', 'web_search_enabled', 'training_allowed', 'history_saved',
+    'memory_enabled', 'custom_instructions_set', 'account_created', 'source_status', 'metadata',
+  ])
+  expect(account).toMatchObject({
+    name: 'rex-account', platform: 'chatgpt', format_version: 1, plan: 'free', paid: false, workspace: 'personal', web_search_enabled: true,
+    source_status: { user_system_messages: 200, accounts_check: 200, settings_user: 200, memories: 200 },
+  })
+  // The conversation pass is the one it would be without the account read.
+  expect(records).toHaveLength(1)
   expect(completions.at(-1)).toMatchObject({ crawled_count: 1, crawled_ids: [CHAT] })
   expect(completions.at(-1).reason).toMatch(/^ok seen=1 dispatched=1 ms=\d+$/)
 })
