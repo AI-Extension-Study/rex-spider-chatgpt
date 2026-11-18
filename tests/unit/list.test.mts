@@ -48,7 +48,7 @@ const projectEntry = (n: number, ms = T0 - n * 1000) => ({
   owner: { user_email: `SECRET-EMAIL-${n}@example.com`, name: `SECRET-NAME-${n}` },
 });
 
-const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Answer => ({ status, headers, text: JSON.stringify(body) });
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Answer => ({ status, headers, text: JSON.stringify(body), redirected: false });
 const page = (items: unknown[], extra: Record<string, unknown> = {}) => json({ items, total: 99, limit: 28, offset: 0, ...extra });
 const empty = () => page([]);
 const projectPage = (items: unknown[], cursor: unknown) => json(cursor === undefined ? { items } : { items, cursor });
@@ -725,7 +725,7 @@ test('a rate-limited, challenged or signed-out answer stops the whole walk as fa
     ['a 429', json({}, 429), 'rate-limited'],
     ['a 503', json({}, 503), 'rate-limited'],
     ['a Retry-After on a 500', json({}, 500, { 'retry-after': '5' }), 'rate-limited'],
-    ['a challenge', { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: '<html>' }, 'challenge'],
+    ['a challenge', { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: '<html>', redirected: false }, 'challenge'],
   ];
   const lists: [string, string, string[]][] = [
     ['main', MAIN(0), [MAIN(0)]],
@@ -759,7 +759,7 @@ test('a refused, server, not-json, timeout, network or bad-page failure ends onl
     ['a 404', json({}, 404), 'refused'],
     ['a 500', json({}, 500), 'server'],
     ['a 502', json({}, 502), 'server'],
-    ['an HTML page', { status: 200, headers: {}, text: '<html>' }, 'not-json'],
+    ['an HTML page', { status: 200, headers: {}, text: '<html>', redirected: false }, 'not-json'],
     ['a timeout', new RequestError('timeout'), 'timeout'],
     ['a network error', new RequestError('network'), 'network'],
     ['a fetch that threw something else', new TypeError('Failed to fetch'), 'network'],
@@ -884,7 +884,7 @@ test('a failure that stops the walk beats the lists that failed before it', asyn
 test('a stop after some chats were read is a failed walk that still holds them, and makes no further request', async () => {
   const fake = run({
     [MAIN(0)]: page([entry(1), entry(2)]),
-    [MAIN(28)]: { status: 429, headers: { 'retry-after': '90' }, text: '{}' },
+    [MAIN(28)]: { status: 429, headers: { 'retry-after': '90' }, text: '{}', redirected: false },
   });
   const result = await fake.result;
   assert.deepEqual(fake.urls, [MAIN(0), MAIN(28)]);
@@ -899,7 +899,7 @@ test('a rate limit on a project list stops the walk there, keeps what the earlie
     [ARCHIVED(0)]: empty(),
     [STARRED(0)]: empty(),
     [SIDEBAR]: json(sidebarOf(P1, P2)),
-    [PROJECT(P1, '0')]: { status: 429, headers: { 'Retry-After': '30' }, text: '' },
+    [PROJECT(P1, '0')]: { status: 429, headers: { 'Retry-After': '30' }, text: '', redirected: false },
   });
   const result = await fake.result;
   assert.ok(!fake.urls.includes(PROJECT(P2, '0')));
@@ -1326,11 +1326,11 @@ test('no title, snippet, owner, address, name or token reaches a log, an error o
     // a project walk with the markers on its items, cut by a repeated cursor
     { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: projectPage([projectEntry(1), { ...projectEntry(2), update_time: 'SECRET-SNIPPET' }], 'a'), [PROJECT(P1, 'a')]: projectPage([projectEntry(3)], 'a') },
     // bad bodies whose text holds the markers
-    { [MAIN(0)]: { status: 200, headers: {}, text: '{"items": "SECRET-TITLE SECRET-SNIPPET SECRET-EMAIL@example.com"' } },
+    { [MAIN(0)]: { status: 200, headers: {}, text: '{"items": "SECRET-TITLE SECRET-SNIPPET SECRET-EMAIL@example.com"', redirected: false } },
     { [MAIN(0)]: json({ items: 'SECRET-TITLE', owner: { user_email: 'SECRET-EMAIL@example.com' } }) },
-    { [MAIN(0)]: { status: 500, headers: {}, text: 'SECRET-TITLE SECRET-NAME' } },
+    { [MAIN(0)]: { status: 500, headers: {}, text: 'SECRET-TITLE SECRET-NAME', redirected: false } },
     // a project failure, by status and by an error that names the project
-    { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: { status: 429, headers: {}, text: 'SECRET-SNIPPET' } },
+    { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: { status: 429, headers: {}, text: 'SECRET-SNIPPET', redirected: false } },
     { ...NOTHING, [SIDEBAR]: json(sidebarOf(P1)), [PROJECT(P1, '0')]: new TypeError(`Failed to fetch SECRET-TITLE ${P1}`) },
   ];
   const logged: string[] = [];

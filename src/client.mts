@@ -6,7 +6,10 @@
 // the URL, which holds a project id, so its text goes no further than this
 // file.
 
-export type Answer = { status: number; headers: Record<string, string>; text: string };
+// redirected is true when fetch followed a redirect to get the answer, so the
+// status, headers and text are those of the page the request was sent on to
+// (a sign-in page, or one a browser rule chose), not of the URL asked for.
+export type Answer = { status: number; headers: Record<string, string>; text: string; redirected: boolean };
 
 export interface Client {
   get(url: string): Promise<Answer>;
@@ -83,7 +86,7 @@ export function createClient({ token, fetch: send = (url, init) => fetch(url, in
         response.headers.forEach((value, name) => {
           answered[name] = value;
         });
-        return { status: response.status, headers: answered, text };
+        return { status: response.status, headers: answered, text, redirected: response.redirected === true };
       } catch {
         throw new RequestError(controller.signal.aborted ? 'timeout' : 'network');
       } finally {

@@ -5,7 +5,7 @@ import { sha256 } from '@bric/rex-core/common';
 import { DateString } from '@bric/rex-types/types';
 
 import { ACCOUNT_SOURCES, type AccountRecord, type AccountState, accountHash, accountSettings } from '../../src/account.mts';
-import { type Answer, RequestError } from '../../src/client.mts';
+import { type Answer, RequestError, createClient } from '../../src/client.mts';
 import { PASS_LIMITS, type PassFramework, type PassLimits, type PassOutcome, runPass } from '../../src/pass.mts';
 import { type BackoffState } from '../../src/backoff.mts';
 import { type Hash, buildDetailRecord, buildSummaryRecord } from '../../src/record.mts';
@@ -55,8 +55,8 @@ function chatDetail(id: string, seconds = T0): Json {
   ), nodeId(2), { conversation_id: id, create_time: seconds, update_time: seconds + 2 });
 }
 
-const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Answer => ({ status, headers, text: JSON.stringify(body) });
-const homePage = (token = TOKEN): Answer => ({ status: 200, headers: { 'content-type': 'text/html' }, text: `<html>\n<script>window.__boot={"accessToken":"${token}"}</script>\n</html>` });
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Answer => ({ status, headers, text: JSON.stringify(body), redirected: false });
+const homePage = (token = TOKEN): Answer => ({ status: 200, headers: { 'content-type': 'text/html' }, text: `<html>\n<script>window.__boot={"accessToken":"${token}"}</script>\n</html>`, redirected: false });
 
 type ListName = 'main' | 'archived' | 'starred' | 'sidebar' | 'project';
 type Reply = Answer | ((read: number) => Answer);
@@ -324,6 +324,19 @@ interface RunOptions {
   readonly dispatchThrowsOn?: string;
   // A detail builder in place of the real one.
   readonly detailBuilder?: typeof buildDetailRecord;
+  // The requests, by label, that the browser reached through a redirect.
+  // Given, every request goes through the real client (client.mts), handed
+  // the site's answer as the Response fetch gives, so the flag comes from
+  // Response.redirected as it does in the browser.
+  readonly redirected?: readonly string[];
+}
+
+// An answer as fetch hands it back. A Response built here cannot set
+// redirected, which fetch sets when it followed one, so the instance gets its
+// own.
+function responseOf(answer: Answer, redirected: boolean): Response {
+  const response = new Response(answer.text, { status: answer.status, headers: answer.headers });
+  return redirected ? Object.defineProperty(response, 'redirected', { value: true }) : response;
 }
 
 // One pass with the fakes. The clock starts at now and moves only with the
@@ -344,14 +357,18 @@ async function pass(web: ReturnType<typeof site>, side: ReturnType<typeof rexSpi
   };
   const lines: string[] = [];
   const outcome: PassOutcome = await runPass({
-    client: (token) => ({
-      get: async (url: string) => {
-        web.requests.push({ url, token });
-        note(`GET ${label(url)}`);
-        clock += url.includes('/backend-api/conversation/') ? options.readMs ?? 0 : options.listMs ?? 0;
-        return web.answerTo(url);
-      },
-    }),
+    client: (token) => {
+      const redirected = options.redirected;
+      const real = redirected === undefined ? undefined : createClient({ token, fetch: async (url) => responseOf(web.answerTo(url), redirected.includes(label(url))) });
+      return {
+        get: async (url: string) => {
+          web.requests.push({ url, token });
+          note(`GET ${label(url)}`);
+          clock += url.includes('/backend-api/conversation/') ? options.readMs ?? 0 : options.listMs ?? 0;
+          return real === undefined ? web.answerTo(url) : real.get(url);
+        },
+      };
+    },
     framework: {
       ...side.framework,
       crawlWindowStart: () => {
@@ -766,7 +783,7 @@ test('a list that is rate-limited or challenged ends the pass with no reading, a
   const limited = await pass(site({ main: [listed(1, 1)], failing: { main: json({}, 429, { 'retry-after': '120' }) } }), rexSpider());
   assert.deepEqual(limited.events.filter((event) => event.startsWith('GET')), ['GET home', 'GET main 0']);
   assert.deepEqual([limited.outcome.count, withoutMs(limited.outcome.reason)], [-1, 'rate-limited stage=list retry-after=120']);
-  const challenged = await pass(site({ main: [listed(1, 1)], failing: { main: { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: '<html>' } } }), rexSpider());
+  const challenged = await pass(site({ main: [listed(1, 1)], failing: { main: { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: '<html>', redirected: false } } }), rexSpider());
   assert.equal(withoutMs(challenged.outcome.reason), 'challenge stage=list');
   const signedOut = await pass(site({ main: [listed(1, 1)], failing: { main: json({}, 401) } }), rexSpider());
   assert.equal(withoutMs(signedOut.outcome.reason), 'not-signed-in stage=list status=401');
@@ -774,13 +791,13 @@ test('a list that is rate-limited or challenged ends the pass with no reading, a
 
 test('the home page decides whether the pass goes on: no token, a 401, another status, or no answer end it there', async () => {
   const cases: [Reply | 'network' | 'timeout', string][] = [
-    [{ status: 200, headers: {}, text: `<html>${MARK} Log in</html>` }, 'not-signed-in stage=home'],
+    [{ status: 200, headers: {}, text: `<html>${MARK} Log in</html>`, redirected: false }, 'not-signed-in stage=home'],
     [json({}, 401), 'not-signed-in stage=home status=401'],
     [json({}, 500), 'http-error stage=home status=500'],
     [json({}, 404), 'http-error stage=home status=404'],
     [json({}, 429, { 'retry-after': '90' }), 'rate-limited stage=home status=429 retry-after=90'],
     [json({}, 503), 'rate-limited stage=home status=503'],
-    [{ status: 403, headers: { 'cf-mitigated': 'challenge' }, text: `<html>${MARK}</html>` }, 'challenge stage=home status=403'],
+    [{ status: 403, headers: { 'cf-mitigated': 'challenge' }, text: `<html>${MARK}</html>`, redirected: false }, 'challenge stage=home status=403'],
     ['network', 'network stage=home'],
     ['timeout', 'timeout stage=home'],
   ];
@@ -870,7 +887,7 @@ const MINUTE = 60_000;
 const SOON = DAY;
 const LATE = 7 * DAY;
 const failing = (status: number, headers: Record<string, string> = {}): Answer => json({ detail: `${MARK} refused` }, status, headers);
-const CHALLENGE: Answer = { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: `<html>${MARK} checking your browser</html>` };
+const CHALLENGE: Answer = { status: 403, headers: { 'cf-mitigated': 'challenge' }, text: `<html>${MARK} checking your browser</html>`, redirected: false };
 const summariesOf = (sent: readonly Json[]) => sent.map((record) => [record.identifier, record.is_summary]);
 
 test('a 429 with Retry-After: 120 on a detail stops the pass, stores a back-off of at least 120 s, and sends nothing for that chat', async () => {
@@ -950,7 +967,7 @@ test('a 401 on a detail ends the pass as signed out, with no back-off, and the n
 });
 
 test('a 401 or no token at the home page, and a 401 on a list, set no back-off either', async () => {
-  for (const options of [{ home: failing(401) }, { home: { status: 200, headers: {}, text: '<html></html>' } }, { main: [listed(1, 1)], failing: { main: failing(401) } }] as SiteOptions[]) {
+  for (const options of [{ home: failing(401) }, { home: { status: 200, headers: {}, text: '<html></html>', redirected: false } }, { main: [listed(1, 1)], failing: { main: failing(401) } }] as SiteOptions[]) {
     const core = rexCore();
     await pass(site(options), rexSpider(), { core });
     assert.deepEqual(core.backoffWrites, []);
@@ -981,7 +998,7 @@ test('a detail that cannot be read sends the summary in its place, with a memo o
     ['a 502', failing(502), SOON],
     ['no answer in time', () => { throw new RequestError('timeout'); }, SOON],
     ['a dropped connection', () => { throw new RequestError('network'); }, SOON],
-    ['a 200 page that is not JSON', { status: 200, headers: {}, text: `<html>${MARK}</html>` }, SOON],
+    ['a 200 page that is not JSON', { status: 200, headers: {}, text: `<html>${MARK}</html>`, redirected: false }, SOON],
     ['a 404', failing(404), LATE],
     ['a 403', failing(403), LATE],
     ['another chat\'s detail', json(chatDetail(chat(9))), LATE],
@@ -1297,13 +1314,56 @@ test('a refusal keeps the hash and send time of the last record sent', async () 
   assert.deepEqual(core.accountWrites, [{ ...stored, readAt: NOW }]);
 });
 
+// A page fetch reached by following a redirect: a sign-in page, or whatever
+// page a browser rule sent the request on to, which can answer JSON too.
+const SIGN_IN: Answer = { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} Log in</html>`, redirected: false };
+const REDIRECT_LINE = 'an account read was redirected; the account reads stop and nothing is sent';
+
+test('an account answer the browser reached through a redirect stops the account reads and sends nothing; the read time is stored, and the pass is as with the account off', async () => {
+  const off = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { slept: () => 0 });
+  // Sent on to a sign-in page, or to a page that answers 200 with the
+  // source's own JSON, which would otherwise be read as the source's.
+  const pages = (source: string): [string, Record<string, Reply>][] => [['a sign-in page', { [source]: SIGN_IN }], ['a JSON page', {}]];
+  for (const source of SOURCES) {
+    for (const [what, account] of pages(source)) {
+      const name = `${what} for ${source}`;
+      const core = rexCore();
+      const run = await pass(site({ main: [listed(1, 1)], account }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, redirected: [source] });
+      assert.deepEqual(accountRequests(run.events), SOURCES.slice(0, SOURCES.indexOf(source) + 1), name);
+      assert.deepEqual(accountsOf(run.sent), [], name);
+      assert.deepEqual(run.outcome, off.outcome, name);
+      assert.deepEqual(run.sent, off.sent, name);
+      assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }], name);
+      assert.ok(run.lines.includes(REDIRECT_LINE), `${name}\n${run.lines.join('\n')}`);
+    }
+  }
+  // A record sent before keeps its hash and send time.
+  const stored: AccountState = { hash: 'b'.repeat(64), sentAt: NOW - 3 * DAY, readAt: NOW - 2 * 60 * MINUTE };
+  const core = rexCore({ account: stored });
+  await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, redirected: ['settings_user'] });
+  assert.deepEqual(core.accountWrites, [{ ...stored, readAt: NOW }]);
+});
+
+test('the home page, the list walk and the detail reads take a redirected answer as they always have', async () => {
+  const everything = ['home', 'main 0', 'main 28', 'archived 0', 'starred 0', 'sidebar', 'project', `detail ${chat(1)}`, `detail ${chat(2)}`];
+  for (const summarize of [true, false]) {
+    const options: SiteOptions = { main: [listed(1, 1), listed(2, 2)], projects: { [PROJECT]: [] } };
+    const plain = await pass(site(options), rexSpider({ summarize }), { slept: () => 0 });
+    const redirected = await pass(site(options), rexSpider({ summarize }), { slept: () => 0, redirected: everything });
+    assert.match(plain.outcome.reason, /^ok seen=2 dispatched=2 /, `summarize ${summarize}`);
+    assert.deepEqual(redirected.outcome, plain.outcome, `summarize ${summarize}`);
+    assert.deepEqual(redirected.events, plain.events, `summarize ${summarize}`);
+    assert.deepEqual(redirected.sent, plain.sent, `summarize ${summarize}`);
+  }
+});
+
 test('an account source that fails otherwise is recorded by its status, or -1, and the other sources are still read', async () => {
   const core = rexCore();
   const web = site({
     main: [listed(1, 1)],
     account: {
       user_system_messages: failing(500),
-      accounts_check: { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} one moment</html>` },
+      accounts_check: { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} one moment</html>`, redirected: false },
       settings_user: () => { throw new RequestError('timeout'); },
       memories: failing(404),
     },

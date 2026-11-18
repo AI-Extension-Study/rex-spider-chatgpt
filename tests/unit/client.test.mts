@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import { type Answer, REQUEST_TIMEOUT_MS, RequestError, classify, createClient, retryAfterMs } from '../../src/client.mts';
 
-const answer = (status: number, text = '{"items":[]}', headers: Record<string, string> = {}): Answer => ({ status, headers, text });
+const answer = (status: number, text = '{"items":[]}', headers: Record<string, string> = {}): Answer => ({ status, headers, text, redirected: false });
 
 // One case per row of the failure policy's table.
 const TABLE: [string, Answer, string][] = [
@@ -28,6 +28,10 @@ const TABLE: [string, Answer, string][] = [
   ['502', answer(502), 'server'],
   ['504', answer(504), 'server'],
   ['a redirect that was not followed', answer(302, ''), 'server'],
+  // Only the account read stops on a redirect; the lists and details read the
+  // page they got as they always have.
+  ['200 with a JSON body reached through a redirect', { ...answer(200), redirected: true }, 'ok'],
+  ['200 with an HTML body reached through a redirect', { ...answer(200, '<html>Log in</html>'), redirected: true }, 'not-json'],
 ];
 
 for (const [name, given, expected] of TABLE) {
@@ -119,6 +123,21 @@ test('get answers any status with its headers (lower-cased) and its body, and do
   assert.equal(got.headers['retry-after'], '30');
   assert.equal(got.headers['content-type'], 'application/json');
   assert.equal(classify(got), 'rate-limited');
+});
+
+// fetch follows a redirect and hands back the last page with redirected set,
+// which a Response built here cannot set, so the instance gets its own.
+const withRedirected = (response: Response, value: unknown): Response => Object.defineProperty(response, 'redirected', { value });
+
+test('get says the answer was reached through a redirect only when fetch says redirected: true', async () => {
+  const get = async (response: Response) => createClient({ token: 'T', fetch: respond(() => response) }).get('https://chatgpt.com/backend-api/settings/user');
+  const followed = await get(withRedirected(new Response('<html>Log in</html>', { status: 200 }), true));
+  assert.equal(followed.redirected, true);
+  assert.equal(followed.status, 200);
+  assert.equal(followed.text, '<html>Log in</html>');
+  assert.equal((await get(new Response('{}'))).redirected, false);
+  // A value of another form, from a fetch that is not the browser's, is none.
+  assert.equal((await get(withRedirected(new Response('{}'), 'true'))).redirected, false);
 });
 
 // Under the service worker's idle limit of about 30 s, so a request cannot

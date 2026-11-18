@@ -270,6 +270,22 @@ test('a plan or a model slug that holds an id is null, or left out of metadata, 
   }
 });
 
+test('a model slug that starts with g- is a custom GPT\'s or a project\'s id, and is left out of metadata though it fits the form', () => {
+  const answers = accountAnswers();
+  const slugs = at(settingsOf(answers), 'last_used_model_config', 'slugs');
+  // A custom GPT's id is g- and 9 characters, too few hex digits in a row
+  // for the id check; a project's is g-p- and 32 hex digits.
+  for (const model of ['g-abc123def', 'g-0a1b2c3d4', 'g-p-0123', 'g-']) {
+    slugs.web = model;
+    assert.equal('last_used_model' in build(answers).metadata, false, model);
+  }
+  // Slugs that start with g but not g- are kept.
+  for (const model of ['gpt-4o', 'gpt-5-3', 'g1-mini']) {
+    slugs.web = model;
+    assert.equal(build(answers).metadata.last_used_model, model);
+  }
+});
+
 test('a plan or a model slug of more than 40 characters is null, or left out of metadata, and one of 40 is kept', () => {
   const answers = accountAnswers();
   const slugs = at(settingsOf(answers), 'last_used_model_config', 'slugs');
@@ -351,10 +367,10 @@ test('account_created and the metadata times are kept only as instants, written 
   const answers = accountAnswers();
   const account = theAccount(answers);
   const entitlement = at(answers.accounts_check.body, 'accounts', ACCOUNT_KEY, 'entitlement');
-  account.created_time = '2023-05-18T23:30:27Z';
+  account.created_time = '2023-02-14T09:30:00Z';
   entitlement.renews_at = '2026-12-17T08:00:00.500-05:00';
   let record = build(answers);
-  assert.equal(record.account_created, '2023-05-18T23:30:27Z');
+  assert.equal(record.account_created, '2023-02-14T09:30:00Z');
   assert.equal(record.metadata.renews_at, '2026-12-17T13:00:00.5Z');
   // Shaped like an instant but none (30 February), not shaped, or a number.
   account.created_time = '2026-02-30T00:00:00Z';
