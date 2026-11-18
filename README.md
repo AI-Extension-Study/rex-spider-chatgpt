@@ -2,7 +2,7 @@
 
 The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow the conversation record layout the Gemini fork also uses, and carry the data format the served configuration names (1 when it names none; see "The data format"). Where the served configuration turns it on, it also sends a `rex-account` record of the account's plan and settings (see "The account record").
 
-**Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension installs this fork at `74712d8` from its release v0.0.59 (2026-11-13) on. The account record (see "The account record") is newer: it is on `main` from the merge that closes #21, and no extension build pins it yet.
+**Where it stands, 2026-11-18.** The extension's release v0.0.59 (2026-11-13) installs this fork at `74712d8`. `main` is newer, and no extension release ships it yet. It adds the account record (see "The account record"), from the merge that closes #21, which the extension's `main` pins at `9b595f1`; and the data format (see "The data format"), which arrives with the extension's next pin of this fork. Until then every browser runs a commit that ignores `data_format` and sends format 1.
 
 ## What it collects
 
@@ -84,9 +84,11 @@ Each mode has its own upload key: the bare chat id in summary mode, the key earl
 
 `data_format` in the served block is one number for the layout of every record the spider sends: each conversation record and the account record carry it as `format_version`. Absent, or anything but an integer from 1 to 999, it is 1, the layout and keys of the builds before the setting existed. The spider takes it again at every configuration refresh, and a pass reads it once, when it starts; one served during a pass applies from the next.
 
-Format 1 keeps the upload keys above. A later format n adds `-f<n>` to both: `<chat id>-f<n>` in summary mode and `<chat id>-detail-f<n>` in detail mode. So when the served format changes, no chat in the crawl window has a key under the new one, and the following passes send every chat in the window once, in the served mode, whenever it was last used: the 90-day limit of a mode switch does not apply. Within one format, a switch of mode works as above, on that format's keys only. The account record's hash includes `format_version`, so the first account read under a new format sends a record.
+Format 1 keeps the upload keys above. A later format n adds `-f<n>` to both: `<chat id>-f<n>` in summary mode and `<chat id>-detail-f<n>` in detail mode. So when the served format changes, no chat in the crawl window has a key under the new one, and the following passes send every chat in the window once, in the served mode, whenever it was last used: the 90-day limit of a mode switch does not apply. Within one format, a switch of mode works as above, on that format's keys only. The account record's hash includes `format_version`, so the first account read under a new format sends a record. That read comes once `interval_minutes` have passed since the last one, so up to that long after the first pass under the new format (60 minutes by default).
 
 The wait after a failed detail read (see "When something fails") is kept per format too, under `rex-spider-chatgpt-detail-memo-<chat id>` in format 1 and `...-f<n>` after. So a chat whose detail read failed before the change is read again at the first pass under the new format, and a read that fails then sends its summary in its place, under the new format.
+
+The old format's upload keys and memos stay in the extension's store after a change of format. Nothing reads, writes or clears them again, so they hold nothing back; they are one small value per chat sent, and per chat whose read failed.
 
 ## What is removed, and how
 

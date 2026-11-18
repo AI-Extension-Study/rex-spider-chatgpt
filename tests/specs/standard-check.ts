@@ -1,10 +1,10 @@
 // @ts-nocheck
 
 // Checks a rex-conversation record of this spider, as the data-upload module
-// gets it (JSON), against the shared conversation record (format 1) and the
-// keys this spider adds to it. Returns the problems as short sentences that
-// carry no value from the record, so a failure prints nothing a chat held.
-// Pure.
+// gets it (JSON), against the shared conversation record and the keys this
+// spider adds to it, under the data format the run served (1 unless the
+// caller says). Returns the problems as short sentences that carry no value
+// from the record, so a failure prints nothing a chat held. Pure.
 
 const STANDARD = ['identifier', 'parent', 'speaker', 'when', 'on_current_branch', 'text_chars', 'text_words', 'citation_count', 'search_result_count', 'attachments']
 const COUNTS = ['text_chars', 'text_words', 'citation_count', 'search_result_count', 'attachments']
@@ -90,12 +90,12 @@ function checkHashes(metadata, problems) {
   }
 }
 
-export function checkRecord(record, mark) {
+export function checkRecord(record, mark, format = 1) {
   if (!isObject(record) || record.name !== 'rex-conversation' || record.platform !== 'chatgpt') return ['not a rex-conversation record of this spider']
   const problems = []
   if (mark !== undefined && JSON.stringify(record).includes(mark)) problems.push('the record holds text from the chat')
   if (!isId(record.identifier)) problems.push('identifier is not an id')
-  if (record.format_version !== 1) problems.push('format_version is not 1')
+  if (record.format_version !== format) problems.push(`format_version is not ${format}`)
   if (typeof record.is_summary !== 'boolean') return [...problems, 'is_summary is not a flag']
   const allowed = record.is_summary ? SUMMARY_KEYS : DETAIL_KEYS
   if (Object.keys(record).some((key) => !allowed.has(key))) problems.push('the record has a key the layout does not name')

@@ -326,6 +326,49 @@ test('served no summarize, a crawl reads each chat and sends detail records that
   await expectAllRouted(serviceWorker, site, unrouted)
 })
 
+test('served summarize under format 1, then detail with data_format 2 in one refresh: every chat is read and sent once as a format 2 detail record that meets the layout, keyed -detail-f2, and the next crawl sends none', async ({ context, serviceWorker, unrouted }) => {
+  test.setTimeout(90_000)
+  const site = new Site()
+  // The last chat was last used long before the last 90 days, which a switch
+  // of mode alone would not read.
+  site.main.push(
+    mainItem(chat(1), Date.parse('2026-09-10T08:00:00.500Z')), mainItem(chat(2), Date.parse('2026-09-09T08:00:00.250Z')),
+    mainItem(chat(3), Date.parse('2026-09-08T13:49:43.781Z')), mainItem(chat(4), Date.parse('2026-05-01T10:00:00.100Z')),
+  )
+  site.details.set(chat(1), reasoningChat(chat(1)))
+  site.details.set(chat(2), editedChat(chat(2)))
+  site.details.set(chat(3), attachmentsChat(chat(3)))
+  site.details.set(chat(4), simpleDetail(chat(4)))
+  await answerChatGPT(context, site)
+  await untilStoreOpen(serviceWorker)
+  await serve(serviceWorker, { summarize: true })
+
+  const first = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual(listWalk())
+  expect(records(first.events).map((record) => [record.identifier, record.is_summary, record.format_version])).toEqual([chat(1), chat(2), chat(3), chat(4)].map((id) => [id, true, 1]))
+  const times = [1789027200500, 1788940800250, 1788875383781, 1777629600100]
+  const summaryKeys = [chat(1), chat(2), chat(3), chat(4)].map((id, at) => uploadKey(id, times[at]))
+  expect(await uploadKeys(serviceWorker)).toEqual([...summaryKeys].sort())
+
+  await serve(serviceWorker, { data_format: 2 })
+  const second = await crawl(serviceWorker)
+  expect(site.calls.splice(0)).toEqual([...listWalk(), `GET detail ${chat(1)}`, `GET detail ${chat(2)}`, `GET detail ${chat(3)}`, `GET detail ${chat(4)}`])
+  const sent = records(second.events)
+  expect(sent.map((record) => [record.identifier, record.is_summary, record.format_version])).toEqual([chat(1), chat(2), chat(3), chat(4)].map((id) => [id, false, 2]))
+  expect(sent.flatMap((record) => checkRecord(record, MARK, 2))).toEqual([])
+  // Held to format 1, the check names the format and nothing else.
+  expect(checkRecord(sent[0], MARK)).toEqual(['format_version is not 1'])
+  expect(completions(second.events)).toEqual([[4, [chat(1), chat(2), chat(3), chat(4)], reason('ok seen=4 dispatched=4')]])
+  const detailKeys = [chat(1), chat(2), chat(3), chat(4)].map((id, at) => uploadKey(`${id}-detail-f2`, times[at]))
+  expect(await uploadKeys(serviceWorker)).toEqual([...summaryKeys, ...detailKeys].sort())
+
+  const third = await crawl(serviceWorker)
+  expect(site.calls).toEqual(listWalk())
+  expect(records(third.events)).toEqual([])
+  expect(completions(third.events)).toEqual([[0, [chat(1), chat(2), chat(3), chat(4)], reason('ok seen=4 dispatched=0')]])
+  await expectAllRouted(serviceWorker, site, unrouted)
+})
+
 // The configs of a study that has ended serve enabled false. The pass reads
 // the spider's flags as rex-spider last set them before each chat, so a
 // refresh that lands between two detail reads stops it before the next one.

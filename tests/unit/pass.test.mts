@@ -1592,8 +1592,10 @@ test('under format 2, a failed detail sends its summary once in its place when o
   const lists = { main: [listed(1, 10)], details: { [chat(1)]: failing(500) } };
   const run = await pass(site(lists), side, { core });
   assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  // dueState looks up the two format 2 keys; the fallback looks up the format
+  // 2 summary key once more, and no format 1 key is looked up at all.
+  assert.deepEqual(run.trace.filter((entry) => entry.startsWith('lookup ')), [`lookup ${chat(1)}-detail-f2`, `lookup ${chat(1)}-f2`, `lookup ${chat(1)}-f2`]);
   assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary, record.format_version]), [[chat(1), true, 2]]);
-  assert.ok(run.trace.includes(`lookup ${chat(1)}-f2`), 'the fallback looked up the format 2 summary key');
   // It gets no key, as under format 1; the format 2 memo keeps it from going out twice.
   assert.deepEqual(side.stamps, []);
   const memo = core.memos.get(`${chat(1)}-f2`) as DetailMemo;
@@ -1626,6 +1628,37 @@ test('the first account read under format 2 sends its record as format 2, though
   assert.equal(second.format_version, 2);
   assert.deepEqual({ ...second, format_version: 1, date: first.date }, first);
   assert.deepEqual(core.held.account, { hash: await hashOfSent(second), sentAt: NOW + 122 * MINUTE, readAt: NOW + 122 * MINUTE });
+});
+
+test('the update most browsers get: summary under format 1, then detail under format 2 in one refresh; every chat in the window is read and sent once as format 2, under -detail-f2 keys, and the next pass sends nothing', async () => {
+  // Chats from 1 day to 400 days back, and one only a project lists. A
+  // switch of mode alone would read only those used in the last 90 days.
+  const lists = { main: [listed(1, 1), listed(2, 3), listed(3, 100), listed(4, 400)], projects: { [PROJECT]: [projectItem(chat(5), { update_time: PROJECT_TIME })] } };
+  const days: Record<number, number> = { 1: 1, 2: 3, 3: 100, 4: 400 };
+  const newestFirst = [chat(1), chat(5), chat(2), chat(3), chat(4)];
+  let served = { summarize: true, format: 1 };
+  const side = rexSpider({ summarize: () => served.summarize, dataFormat: () => served.format });
+  const core = rexCore();
+  const first = await pass(site(lists), side, { core });
+  assert.deepEqual(first.sent.map((record) => [record.is_summary, record.format_version]), newestFirst.map(() => [true, 1]));
+  const summaryKeys = [1, 2, 3, 4].map((n) => keyOf(n, days[n], 'summary')).concat(`${chat(5)} ${projectKeyMs(PROJECT_TIME)}`);
+  assert.deepEqual([...side.stamps].sort(), [...summaryKeys].sort());
+
+  served = { summarize: false, format: 2 };
+  const stampedBefore = side.stamps.length;
+  const second = await pass(site(lists), side, { core });
+  assert.deepEqual(detailsOf(second.events), newestFirst);
+  assert.deepEqual(second.sent.map((record) => [record.identifier, record.is_summary, record.format_version]), newestFirst.map((id) => [id, false, 2]));
+  const detailKeys = [1, 2, 3, 4].map((n) => keyOf(n, days[n], 'detail', 2)).concat(`${chat(5)}-detail-f2 ${projectKeyMs(PROJECT_TIME)}`);
+  assert.deepEqual(side.stamps.slice(stampedBefore).sort(), [...detailKeys].sort());
+  // The switch of mode is dated as any switch is.
+  assert.deepEqual(core.writes, [{ mode: 'summary', since: NOW }, { mode: 'detail', since: NOW }]);
+  assert.equal(withoutMs(second.outcome.reason), 'ok seen=5 dispatched=5');
+
+  const third = await pass(site(lists), side, { core });
+  assert.deepEqual(detailsOf(third.events), []);
+  assert.deepEqual(third.sent, []);
+  assert.equal(withoutMs(third.outcome.reason), 'ok seen=5 dispatched=0');
 });
 
 // --- The memo per data format ---
