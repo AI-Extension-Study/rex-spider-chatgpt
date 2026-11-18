@@ -1,6 +1,7 @@
 // One crawl pass: the access token from the home page, the list walk, and a
 // record for each chat in the crawl window that is not sent yet in the served
-// mode. Summary mode sends the list item; detail mode reads the chat first.
+// mode and data format. Summary mode sends the list item; detail mode reads
+// the chat first.
 // Served on, the account read (readAccount) comes between the home page and
 // the list walk, and changes nothing else in the pass. The requests,
 // rex-spider's side, rex-core's store, the dispatch, the waits and the clock
@@ -25,6 +26,7 @@ import {
 } from './account.mts';
 import { type BackoffCode, type BackoffState, backoffDecision, nextBackoff } from './backoff.mts';
 import { type Answer, type Classification, type Client, RequestError, classify, retryAfterMs } from './client.mts';
+import { dataFormatOf } from './format.mts';
 import { HOME_URL, accessToken } from './home.mts';
 import { uploadKeyId } from './keys.mts';
 import { type CrawlWindow, type ListItem, type WalkResult, crawlDelayMs, uploadTime, walkLists } from './list.mts';
@@ -37,11 +39,13 @@ import { type ChatGPTStore, type DetailMemo, type Mode } from './store.mts';
 // The rex-spider calls the pass makes on the spider. The flags are the
 // served config as of the last refresh, read where they apply: isEnabled
 // before every request, the served mode before each chat, the served account
-// block (account.mts) once, when the account read would start. The crawl
-// window and the upload keys go to rex-core, which never answers while its
-// database is not open, so each such call has a deadline.
+// block (account.mts) once, when the account read would start, and the data
+// format (format.mts) once, as the pass starts. The crawl window and the
+// upload keys go to rex-core, which never answers while its database is not
+// open, so each such call has a deadline.
 export interface PassFramework {
   account(): AccountSettings;
+  dataFormat(): number;
   isEnabled(): boolean;
   justSummarize(): boolean;
   continueAfterError(): boolean;
@@ -150,6 +154,11 @@ interface Pass {
   readonly say: (line: string) => void;
   readonly hash: Hash;
   readonly records: Records;
+  // The data format as served when the pass started: every record of the
+  // pass carries it, and every upload key it looks up or stamps is its
+  // (keys.mts). One served during the pass applies from the next pass, as a
+  // record and its key must agree.
+  readonly format: number;
   // When the pass started, for the ms its reason ends with.
   readonly started: number;
   // Time spent in the paced waits, which the detail budget leaves out.
@@ -298,7 +307,7 @@ async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Send
         // A hash that hangs holds a record for the hash deadline, and a batch
         // of them would outlast the worker's idle limit with no call between.
         touch(pass.deps.keepAlive, pass.say);
-        if (!dispatched(pass, await pass.records.summary(item, pass.hash))) {
+        if (!dispatched(pass, await pass.records.summary(item, pass.hash, pass.format))) {
           stop = 'internal';
           break;
         }
@@ -308,7 +317,7 @@ async function sendSummaries(pass: Pass, due: readonly ListItem[]): Promise<Send
       if (out.length > 0) {
         await pace(pass, pass.limits.settleMs);
         for (const item of out) {
-          if (!(await stamp(pass, uploadKeyId(item.id, true), uploadTime(item)))) {
+          if (!(await stamp(pass, uploadKeyId(item.id, true, pass.format), uploadTime(item)))) {
             stop = 'store';
             break;
           }
@@ -346,7 +355,7 @@ async function readDetail(pass: Pass, client: Pick<Client, 'get'>, item: ListIte
     // behind it would never be read.
     let record: Record<string, unknown> | null;
     try {
-      record = await pass.records.detail(JSON.parse(answer.text), item, pass.hash);
+      record = await pass.records.detail(JSON.parse(answer.text), item, pass.hash, pass.format);
     } catch (error) {
       pass.say(`the record builder failed on a detail (${nameOf(error)})`);
       record = null;
@@ -466,7 +475,7 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
         // The key's time is the list's, as the key was checked, never the
         // record's ended (its latest message), which would make the key new
         // on every pass.
-        pending = { kind: 'stamp', id: uploadKeyId(item.id, false), at };
+        pending = { kind: 'stamp', id: uploadKeyId(item.id, false, pass.format), at };
         continue;
       }
       if (read.why === 'rate-limited' || read.why === 'challenge') {
@@ -486,12 +495,12 @@ async function sendDetails(pass: Pass, client: Pick<Client, 'get'>, due: readonl
       inARow += 1;
       const failures = (earlier?.failures ?? 0) + 1;
       // The summary goes out in the detail's place once per list time: at a
-      // first failure, and unless summary mode sent it at that time before a
-      // switch. It gets no key: a chat last used before the re-send window
-      // would then count as sent in detail (mode.mts), and its read would
-      // never come again.
-      if (failures === 1 && !(await lookup(pass)(uploadKeyId(item.id, true), at))) {
-        if (!dispatched(pass, await pass.records.summary(item, pass.hash))) {
+      // first failure, and unless summary mode sent it at that time, under
+      // the pass's format, before a switch. It gets no key: a chat last used
+      // before the re-send window would then count as sent in detail
+      // (mode.mts), and its read would never come again.
+      if (failures === 1 && !(await lookup(pass)(uploadKeyId(item.id, true, pass.format), at))) {
+        if (!dispatched(pass, await pass.records.summary(item, pass.hash, pass.format))) {
           // No memo, so a later pass reads the chat at once and sends its
           // summary then.
           stop = 'internal';
@@ -542,7 +551,7 @@ async function sendAll(pass: Pass, client: Pick<Client, 'get'>, walk: WalkResult
         continue;
       }
       // The time is the one the key is built from on the item's list path.
-      const need = await dueState(transmitted, item.id, uploadTime(item), served, since);
+      const need = await dueState(transmitted, item.id, uploadTime(item), served, since, pass.format);
       if (need === 'due') {
         due.push(item);
       } else if (need === 'held') {
@@ -677,7 +686,7 @@ async function sendAccount(pass: Pass, answers: Readonly<Record<string, AccountA
     return null;
   }
   try {
-    const record = buildChatGPTAccount(answers, readAt);
+    const record = buildChatGPTAccount(answers, readAt, pass.format);
     const hash = await withDeadline(accountHash(record), pass.limits.hashMs);
     if (hash === TIMED_OUT) {
       pass.say('the account record was not sent (the hash did not answer)');
@@ -923,7 +932,10 @@ export async function runPass(deps: PassDeps, now: () => number): Promise<PassOu
   try {
     const limits = deps.limits ?? PASS_LIMITS;
     pass = {
-      deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), records: deps.records ?? RECORDS, started: now(), waited: 0, stage: 'start',
+      deps, limits, now, say, hash: boundedHash(deps.hash, limits.hashMs), records: deps.records ?? RECORDS,
+      // The spider has checked it already. Checked again, so that anything
+      // else a framework gives is format 1, never a key keys.mts refuses.
+      format: dataFormatOf(deps.framework.dataFormat()), started: now(), waited: 0, stage: 'start',
       backoff: null, refusal: null, pagesRead: 0,
     };
     let outcome: PassOutcome;

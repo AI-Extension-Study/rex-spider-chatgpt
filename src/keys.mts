@@ -4,6 +4,7 @@
 // rex-spider-chatgpt-conversation-upload-<id>-<ms>, which rex-spider builds
 // from the id below and the list's update_time as the list path reads it
 // (list.mts, uploadTime).
+import { DEFAULT_DATA_FORMAT, isDataFormat } from './format.mts';
 
 export const KEY_PREFIX = 'rex-spider-chatgpt-';
 
@@ -14,11 +15,18 @@ function chatIdOrThrow(chatId: string): string {
   return chatId;
 }
 
-// The id an upload key is built from, one per mode, so a chat sent in one
-// mode is unsent in the other. Summary mode keeps the bare chat id, the key
-// earlier builds of this module wrote, so an update sends nothing again there.
-export function uploadKeyId(chatId: string, summary: boolean): string {
-  return summary ? chatIdOrThrow(chatId) : `${chatIdOrThrow(chatId)}-detail`;
+// The id an upload key is built from, one per mode and data format
+// (format.mts), so a chat sent in one mode, or under one format, is unsent in
+// another. Format 1 keeps the ids earlier builds of this module wrote: the
+// bare chat id in summary mode, so an update sends nothing again there, and
+// -detail in detail mode. A later format adds -f and its number to both. A
+// format that is not one is refused, so no key is built from it.
+export function uploadKeyId(chatId: string, summary: boolean, format: number): string {
+  if (!isDataFormat(format)) {
+    throw new TypeError('a data format must be an integer from 1 to 999');
+  }
+  const id = summary ? chatIdOrThrow(chatId) : `${chatIdOrThrow(chatId)}-detail`;
+  return format === DEFAULT_DATA_FORMAT ? id : `${id}-f${format}`;
 }
 
 // The served mode and when this browser first saw it (store.mts, ModeRecord).

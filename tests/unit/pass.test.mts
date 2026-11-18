@@ -43,7 +43,8 @@ test('the project chats of these tests are listed at a time the project path rea
 
 // A main-list item last used `days` before the pass, and its key's time.
 const listed = (n: number, days: number, fields: Json = {}): Json => listItem(chat(n), { update_time: listTime(NOW - days * DAY), create_time: listTime(NOW - days * DAY - 3_600_000), ...fields });
-const keyOf = (n: number, days: number, mode: 'summary' | 'detail'): string => `${chat(n)}${mode === 'detail' ? '-detail' : ''} ${mainKeyMs(listTime(NOW - days * DAY))}`;
+// Under a format after 1, the id ends in -f and the format (keys.mts).
+const keyOf = (n: number, days: number, mode: 'summary' | 'detail', format = 1): string => `${chat(n)}${mode === 'detail' ? '-detail' : ''}${format > 1 ? `-f${format}` : ''} ${mainKeyMs(listTime(NOW - days * DAY))}`;
 
 // A chat's detail: a prompt and an answer at T0, which is not its list time,
 // so a record's ended (its latest message) differs from the key's time.
@@ -173,6 +174,8 @@ interface SideOptions {
   readonly onWindow?: () => void;
   // The served account block, as rex-spider merged it. Absent: off.
   readonly account?: unknown;
+  // The data format as served (format.mts). Absent: 1.
+  readonly dataFormat?: number | (() => number);
 }
 
 // rex-spider's side as the pass sees it: the served flags, the crawl window,
@@ -185,6 +188,7 @@ function rexSpider(options: SideOptions = {}) {
   const keyOfCall = (id: string, at: DateString) => `${id} ${Math.round(at.timestamp())}`;
   const framework: PassFramework = {
     account: () => accountSettings(the(options.account, undefined)),
+    dataFormat: () => the(options.dataFormat, 1),
     isEnabled: () => the(options.enabled, true),
     justSummarize: () => the(options.summarize, false),
     continueAfterError: () => !the(options.halt, true),
@@ -831,9 +835,9 @@ test('a detail that gives no record is a detail that cannot be read: its summary
 
 // A builder that throws on one chat's detail (no input is known to make the
 // real one throw; this stands in for a fault in a later build).
-const throwsOn = (id: string): typeof buildDetailRecord => async (json, item, hash) => {
+const throwsOn = (id: string): typeof buildDetailRecord => async (json, item, hash, format) => {
   if (item.id === id) throw new TypeError('the builder broke');
-  return buildDetailRecord(json, item, hash);
+  return buildDetailRecord(json, item, hash, format);
 };
 
 test('a record builder that throws on a chat\'s detail is a detail that cannot be read: its summary and a 7-day memo, and the next chat is read', async () => {
@@ -1517,4 +1521,100 @@ test('an account state that is not kept is logged, and the next pass reads the a
   assert.ok(first.lines.includes('the account state was not kept'), first.lines.join('\n'));
   const next = await pass(site({ main: [listed(1, 1)] }), side, { core, now: NOW + MINUTE, slept: () => 0 });
   assert.deepEqual(accountRequests(next.events), SOURCES);
+});
+
+// --- The data format ---
+
+test('after a format 1 pass stamped every chat, a pass under format 2 sends every chat in the window once as format 2, under -f2 keys, and the pass after it sends nothing', async () => {
+  // Chats from 1 day to 400 days back, and one only a project lists: a
+  // switch of mode would send none of those used more than 90 days ago again.
+  const lists = { main: [listed(1, 1), listed(2, 3), listed(3, 100), listed(4, 400)], projects: { [PROJECT]: [projectItem(chat(5), { update_time: PROJECT_TIME })] } };
+  const days: Record<number, number> = { 1: 1, 2: 3, 3: 100, 4: 400 };
+  const newestFirst = [chat(1), chat(5), chat(2), chat(3), chat(4)];
+  for (const mode of ['detail', 'summary'] as const) {
+    let format = 1;
+    const side = rexSpider({ summarize: mode === 'summary', dataFormat: () => format });
+    const core = rexCore();
+    const keysOf = (f: number) => [1, 2, 3, 4].map((n) => keyOf(n, days[n], mode, f)).concat(`${chat(5)}${mode === 'detail' ? '-detail' : ''}${f > 1 ? `-f${f}` : ''} ${projectKeyMs(PROJECT_TIME)}`);
+    const first = await pass(site(lists), side, { core });
+    assert.deepEqual(first.sent.map((record) => record.format_version), [1, 1, 1, 1, 1], mode);
+    assert.deepEqual([...side.stamps].sort(), keysOf(1).sort(), mode);
+    // The served mode does not change, as on an arm already in detail: only
+    // the format does.
+    format = 2;
+    const stampedBefore = side.stamps.length;
+    const second = await pass(site(lists), side, { core });
+    assert.deepEqual(second.sent.map((record) => record.identifier), newestFirst, mode);
+    assert.deepEqual(second.sent.map((record) => [record.format_version, record.is_summary]), newestFirst.map(() => [2, mode === 'summary']), mode);
+    if (mode === 'detail') assert.deepEqual(detailsOf(second.events), newestFirst);
+    assert.deepEqual(side.stamps.slice(stampedBefore).sort(), keysOf(2).sort(), mode);
+    assert.equal(withoutMs(second.outcome.reason), 'ok seen=5 dispatched=5', mode);
+    assert.deepEqual(core.writes, [{ mode, since: NOW }], `${mode}: the mode record is not written again`);
+    const third = await pass(site(lists), side, { core });
+    assert.deepEqual(third.sent, [], mode);
+    assert.deepEqual(detailsOf(third.events), [], mode);
+    assert.equal(withoutMs(third.outcome.reason), 'ok seen=5 dispatched=0', mode);
+  }
+});
+
+test('the format is read once, at the start of the pass: one served during the pass changes neither its records nor its keys', async () => {
+  let format = 2;
+  const side = rexSpider({ dataFormat: () => format });
+  // The format turns to 3 as the first detail is read.
+  const web = site({ main: [listed(1, 1), listed(2, 2)], details: { [chat(1)]: () => { format = 3; return json(chatDetail(chat(1))); } } });
+  const run = await pass(web, side);
+  assert.deepEqual(run.sent.map((record) => record.format_version), [2, 2]);
+  assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail', 2), keyOf(2, 2, 'detail', 2)]);
+});
+
+test('a format the framework gives that is not an integer from 1 to 999 is taken as 1', async () => {
+  for (const given of [0, 1000, 1.5, NaN, '2' as unknown as number, undefined as unknown as number]) {
+    const side = rexSpider({ dataFormat: () => given });
+    const run = await pass(site({ main: [listed(1, 1)] }), side);
+    assert.deepEqual(run.sent.map((record) => record.format_version), [1], String(given));
+    assert.deepEqual(side.stamps, [keyOf(1, 1, 'detail')], String(given));
+  }
+});
+
+test('under format 2, a failed detail sends its summary once in its place when only format 1 keys exist', async () => {
+  // A browser that sent chat 1 in both modes under format 1, served detail since long ago.
+  const side = rexSpider({ halt: false, crawlDelay: 0, dataFormat: 2, keys: [keyOf(1, 10, 'summary'), keyOf(1, 10, 'detail')] });
+  const core = rexCore({ mode: { mode: 'detail', since: NOW - 200 * DAY } });
+  const lists = { main: [listed(1, 10)], details: { [chat(1)]: failing(500) } };
+  const run = await pass(site(lists), side, { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(run.sent.map((record) => [record.identifier, record.is_summary, record.format_version]), [[chat(1), true, 2]]);
+  assert.ok(run.trace.includes(`lookup ${chat(1)}-f2`), 'the fallback looked up the format 2 summary key');
+  // It gets no key, as under format 1; the memo keeps it from going out twice.
+  assert.deepEqual(side.stamps, []);
+  const memo = core.memos.get(chat(1)) as DetailMemo;
+  assert.equal(memo.failures, 1);
+  const again = await pass(site(lists), side, { core, now: memo.at + memo.retryMs });
+  assert.deepEqual(detailsOf(again.events), [chat(1)]);
+  assert.deepEqual(again.sent, []);
+});
+
+test('under format 2, a failed detail sends no summary in its place when the format 2 summary key exists', async () => {
+  const side = rexSpider({ halt: false, dataFormat: 2, keys: [keyOf(1, 10, 'summary', 2)] });
+  const core = rexCore({ mode: { mode: 'summary', since: NOW - 200 * DAY } });
+  const run = await pass(site({ main: [listed(1, 10)], details: { [chat(1)]: failing(500) } }), side, { core });
+  assert.deepEqual(detailsOf(run.events), [chat(1)]);
+  assert.deepEqual(run.sent, []);
+  assert.deepEqual(core.memoWrites.map(([chatId]) => chatId), [chat(1)]);
+});
+
+test('the first account read under format 2 sends its record as format 2, though the answers did not change', async () => {
+  let format = 1;
+  const core = rexCore();
+  const side = rexSpider({ summarize: true, account: ACCOUNT_ON, dataFormat: () => format });
+  const at = async (minutes: number) => pass(site({ main: [listed(1, 1)] }), side, { core, now: NOW + minutes * MINUTE, slept: () => 0 });
+  const [first] = accountsOf((await at(0)).sent);
+  assert.equal(first.format_version, 1);
+  // Under format 1 the same answers 61 minutes on send nothing.
+  assert.deepEqual(accountsOf((await at(61)).sent), []);
+  format = 2;
+  const [second] = accountsOf((await at(122)).sent);
+  assert.equal(second.format_version, 2);
+  assert.deepEqual({ ...second, format_version: 1, date: first.date }, first);
+  assert.deepEqual(core.held.account, { hash: await hashOfSent(second), sentAt: NOW + 122 * MINUTE, readAt: NOW + 122 * MINUTE });
 });

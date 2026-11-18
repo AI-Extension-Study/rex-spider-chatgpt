@@ -1,15 +1,15 @@
-// The rex-account record (format 1): the account's plan and settings, read
-// from four GETs, and the rules that say when to read them and when to send
-// the record. Every key of the shared account layout is on every record; a
-// key is null when its source did not answer 200 with an object, the site
-// holds no such key, or the value has the wrong form. Nothing in the record
-// is an id, a name or text the person wrote: each key is a boolean, a count,
-// an instant, or a string held to a short enum form. metadata keeps only the
-// keys listed here, and leaves a key out when its value has the wrong form.
-// Pure but for the hash.
+// The rex-account record: the account's plan and settings, read from four
+// GETs, stamped with the data format it is built under (format.mts), and the
+// rules that say when to read them and when to send the record. Every key of
+// the shared account layout is on every record; a key is null when its source
+// did not answer 200 with an object, the site holds no such key, or the value
+// has the wrong form. Nothing in the record is an id, a name or text the
+// person wrote: each key is a boolean, a count, an instant, or a string held
+// to a short enum form. metadata keeps only the keys listed here, and leaves
+// a key out when its value has the wrong form. Pure but for the hash.
 import { DateString } from '@bric/rex-types/types';
 
-import { FORMAT_VERSION, type Hash, hashOf } from './record.mts';
+import { type Hash, hashOf } from './record.mts';
 
 const NAME = 'rex-account';
 const PLATFORM = 'chatgpt';
@@ -150,9 +150,10 @@ const sha256: Hash = async (text) => {
 };
 
 // The hash a record is compared by: SHA-256 of the record without date, so
-// two reads with the same values have the same hash. It is only stored, never
-// sent. Throws when the digest fails, which the caller's catch takes as a
-// failed read.
+// two reads with the same values have the same hash, and a record of another
+// format_version has another, which sends it at the first read under a new
+// format. It is only stored, never sent. Throws when the digest fails,
+// which the caller's catch takes as a failed read.
 export async function accountHash(record: AccountRecord): Promise<string> {
   const content: Record<string, unknown> = { ...record };
   delete content.date;
@@ -288,7 +289,7 @@ const asModel = (value: unknown): string | undefined => formed(value, MODEL_FORM
 const asCount = (value: unknown): number | undefined => (Array.isArray(value) && value.length <= MAX_COUNT ? value.length : undefined);
 const asTime = (value: unknown): string | null | undefined => (value === null ? null : utcInstant(value) ?? undefined);
 
-export function buildChatGPTAccount(answers: Readonly<Record<string, AccountAnswer>>, now: number): AccountRecord {
+export function buildChatGPTAccount(answers: Readonly<Record<string, AccountAnswer>>, now: number, format: number): AccountRecord {
   const system = bodyOf(answers, 'user_system_messages');
   const entry = accountEntry(bodyOf(answers, 'accounts_check'));
   const account = field(entry, 'account');
@@ -320,7 +321,7 @@ export function buildChatGPTAccount(answers: Readonly<Record<string, AccountAnsw
   return {
     name: NAME,
     platform: PLATFORM,
-    format_version: FORMAT_VERSION,
+    format_version: format,
     date: now,
     plan: formed(field(account, 'plan_type'), PLAN_FORM),
     paid: flag(field(entitlement, 'has_active_subscription')),

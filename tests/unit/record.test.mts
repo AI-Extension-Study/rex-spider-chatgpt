@@ -35,13 +35,13 @@ const DETAIL_METADATA_KEYS = [
 // The builders, each record checked for text from the list or the chat,
 // whatever the test.
 async function summaryOf(item: ListItem, hash: Hash = sha256): Promise<Json> {
-  const record = await buildSummaryRecord(item, hash);
+  const record = await buildSummaryRecord(item, hash, 1);
   assert.equal(JSON.stringify(record).includes(MARK), false, 'text from the list is in the summary');
   return record;
 }
 
 async function detailOf(chat: unknown, item: ListItem, hash: Hash = sha256): Promise<Json | null> {
-  const record = await buildDetailRecord(chat, item, hash);
+  const record = await buildDetailRecord(chat, item, hash, 1);
   assert.equal(JSON.stringify(record).includes(MARK), false, 'text from the chat is in the record');
   return record;
 }
@@ -344,7 +344,7 @@ test('text planted in any value the skeleton copies never reaches the detail rec
     const chat = smallDetail();
     plant(chat);
     // Built directly, so a failure names the field.
-    const record = await buildDetailRecord(chat, item, sha256);
+    const record = await buildDetailRecord(chat, item, sha256, 1);
     assert.ok(record !== null, what);
     assert.equal(JSON.stringify(record).includes(MARK), false, what);
   }
@@ -391,4 +391,21 @@ test('an empty title or an id that is not a string is not hashed', async () => {
   const metadata = (await detailOf(chat, await one([listItem(CHAT_ID)]), hash))?.metadata as Json;
   assert.deepEqual([metadata.title_hash, metadata.gizmo_id_hash, metadata.conversation_template_id_hash], [null, null, null]);
   assert.deepEqual(asked, []);
+});
+
+test('a record built under format 2 says format_version 2, and is otherwise the format 1 record', async () => {
+  const item = await one([listItem(CHAT_ID)]);
+  const project = await one([], [projectItem(PROJECT_CHAT)]);
+  for (const listedItem of [item, project]) {
+    const [one1, one2] = [await buildSummaryRecord(listedItem, sha256, 1), await buildSummaryRecord(listedItem, sha256, 2)];
+    assert.equal(one2.format_version, 2);
+    assert.deepEqual(Object.keys(one2), Object.keys(one1));
+    assert.deepEqual(uploaded({ ...one2, format_version: 1 }), uploaded(one1));
+  }
+  const [detail1, detail2] = [await buildDetailRecord(smallDetail(), item, sha256, 1), await buildDetailRecord(smallDetail(), item, sha256, 2)];
+  assert.ok(detail1 !== null && detail2 !== null, 'Test setup invalid: the builder gave no record');
+  assert.equal(detail2.format_version, 2);
+  assert.deepEqual(Object.keys(detail2), Object.keys(detail1));
+  assert.deepEqual(uploaded({ ...detail2, format_version: 1 }), uploaded(detail1));
+  assert.equal(JSON.stringify(detail2).includes(MARK), false);
 });

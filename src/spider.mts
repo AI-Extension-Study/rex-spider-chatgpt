@@ -1,13 +1,14 @@
 // The spider rex-spider runs for ChatGPT: its name, the URLs the extension
-// lets it reach, the served mode, halt_on_error and account block, and a
-// crawl that is one pass (src/pass.mts). src/service-worker.mts makes the
-// instance and registers it.
+// lets it reach, the served mode, halt_on_error, account block and data
+// format, and a crawl that is one pass (src/pass.mts).
+// src/service-worker.mts makes the instance and registers it.
 import { sha256 } from '@bric/rex-core/common';
 import rexCorePlugin, { dispatchEvent } from '@bric/rex-core/service-worker';
 import { REXSpider, type REXSpiderCrawlResult } from '@bric/rex-spider/service-worker';
 
 import { ACCOUNT_SOURCES, type AccountSettings, accountSettings } from './account.mts';
 import { createClient } from './client.mts';
+import { dataFormatOf } from './format.mts';
 import { HOME_URL, accessToken } from './home.mts';
 import { sleep } from './pacing.mts';
 import { runPass } from './pass.mts';
@@ -34,6 +35,10 @@ export class ChatGPTSpider extends REXSpider {
   // enabled true (src/account.mts). A refresh without one turns it off.
   accountServed: AccountSettings = accountSettings(undefined);
 
+  // data_format as served on the last refresh (src/format.mts): 1 unless it
+  // is an integer from 1 to 999. A refresh without one is format 1 again.
+  dataFormatServed = dataFormatOf(undefined);
+
   // Whether a pass is running, set the moment a crawl starts. rex-spider's
   // own flag is set only once rex-core has stored the crawl's start, so a
   // second round could start a second pass before it, and two passes would
@@ -50,10 +55,16 @@ export class ChatGPTSpider extends REXSpider {
     // rex-spider's configuration type has no account key, so the block is
     // read as unknown and checked in src/account.mts.
     this.accountServed = accountSettings('account' in configuration ? configuration.account : undefined);
+    // Nor a data_format key: read as unknown and checked in src/format.mts.
+    this.dataFormatServed = dataFormatOf('data_format' in configuration ? configuration.data_format : undefined);
   }
 
   account(): AccountSettings {
     return this.accountServed;
+  }
+
+  dataFormat(): number {
+    return this.dataFormatServed;
   }
 
   justSummarize(): boolean {

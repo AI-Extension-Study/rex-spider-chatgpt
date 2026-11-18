@@ -7,6 +7,9 @@
 // in the store, so a browser that was offline when the config changed still
 // gets the full window. A browser that has never stored a mode, such as one
 // updated from a build that keyed both modes alike, counts as switching then.
+// The rule runs within one data format (format.mts): the keys it reads are
+// the pass's format's, so a chat sent under another format, in either mode,
+// is due.
 import type { DateString } from '@bric/rex-types/types';
 
 import { uploadKeyId } from './keys.mts';
@@ -45,19 +48,19 @@ export async function resendSince(store: Pick<ChatGPTStore, 'mode'>, served: Mod
 // again.
 export type Transmitted = (id: string, ended: DateString) => Promise<boolean>;
 
-// What a chat in the crawl window needs this pass. sent: it was sent in the
-// served mode at this time, or sent in the other mode at this time and last
-// used more than RESEND_WINDOW_MS before the switch. due: it is to be sent.
-// held: it was sent in the other mode, and with no start for this pass (since
-// null) it is held back rather than sent. The time is the one its upload key
-// is built from (list.mts, uploadTime).
+// What a chat in the crawl window needs this pass, under the pass's data
+// format. sent: it was sent in the served mode at this time, or sent in the
+// other mode at this time and last used more than RESEND_WINDOW_MS before the
+// switch. due: it is to be sent. held: it was sent in the other mode, and with
+// no start for this pass (since null) it is held back rather than sent. The
+// time is the one its upload key is built from (list.mts, uploadTime).
 export type Need = 'sent' | 'due' | 'held';
 
-export async function dueState(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null): Promise<Need> {
-  if (await transmitted(uploadKeyId(chatId, served === 'summary'), ended)) {
+export async function dueState(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null, format: number): Promise<Need> {
+  if (await transmitted(uploadKeyId(chatId, served === 'summary', format), ended)) {
     return 'sent';
   }
-  if (!(await transmitted(uploadKeyId(chatId, served !== 'summary'), ended))) {
+  if (!(await transmitted(uploadKeyId(chatId, served !== 'summary', format), ended))) {
     return 'due';
   }
   if (since === null) {
@@ -67,6 +70,6 @@ export async function dueState(transmitted: Transmitted, chatId: string, ended: 
 }
 
 // Whether a chat in the crawl window needs nothing this pass: sent, or held.
-export async function sentAlready(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null): Promise<boolean> {
-  return (await dueState(transmitted, chatId, ended, served, since)) !== 'due';
+export async function sentAlready(transmitted: Transmitted, chatId: string, ended: DateString, served: Mode, since: number | null, format: number): Promise<boolean> {
+  return (await dueState(transmitted, chatId, ended, served, since, format)) !== 'due';
 }
