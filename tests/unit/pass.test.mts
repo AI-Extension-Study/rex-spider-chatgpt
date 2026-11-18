@@ -1165,7 +1165,7 @@ test('a back-off is not cleared by a pass whose list pages all failed without a 
 const ACCOUNT_ON = { enabled: true };
 // The account reads as the events write them: a paced wait before each.
 const ACCOUNT_READS = SOURCES.flatMap((source) => ['wait 30000', `GET ${source}`]);
-const accountRequests = (events: readonly string[]): string[] => events.filter((event) => SOURCES.includes(event.slice('GET '.length))).map((event) => event.slice('GET '.length));
+const accountRequests = (events: readonly string[]): string[] => events.filter((event) => event.startsWith('GET ') && SOURCES.includes(event.slice('GET '.length))).map((event) => event.slice('GET '.length));
 const accountsOf = (sent: readonly Json[]): Json[] => sent.filter((record) => record.name === 'rex-account');
 const hashOfSent = (record: Json): Promise<string> => accountHash(record as unknown as AccountRecord);
 // The summary pass over one chat, as it runs with the account read off.
@@ -1177,7 +1177,7 @@ test('with the account read off, a pass makes the requests and waits it made bef
   for (const account of [undefined, { enabled: false }, { interval_minutes: 30 }, { enabled: 'true' }]) {
     const web = site({ main: [listed(1, 1)] });
     const run = await pass(web, rexSpider({ summarize: true, account }));
-    assert.deepEqual(run.events, ONE_CHAT, JSON.stringify(account));
+    assert.deepEqual(run.events, ONE_CHAT, String(JSON.stringify(account)));
     assert.deepEqual(web.accountReads, []);
     assert.equal(run.trace.some((entry) => entry.startsWith('account ')), false);
   }
@@ -1286,6 +1286,8 @@ test('a refused, rate-limited, challenged or signed-out account read stops the a
   }
   const limited = await pass(site({ main: [listed(1, 1)], account: { user_system_messages: failing(429) } }), rexSpider({ summarize: true, account: ACCOUNT_ON }));
   assert.ok(limited.lines.includes('an account read was refused (rate-limited, status 429); the account reads stop and nothing is sent'), limited.lines.join('\n'));
+  const forbidden = await pass(site({ main: [listed(1, 1)], account: { user_system_messages: failing(403) } }), rexSpider({ summarize: true, account: ACCOUNT_ON }));
+  assert.ok(forbidden.lines.includes('an account read was refused (forbidden, status 403); the account reads stop and nothing is sent'), forbidden.lines.join('\n'));
 });
 
 test('a refusal keeps the hash and send time of the last record sent', async () => {
@@ -1373,6 +1375,26 @@ test('a switch-off during the account reads stops them before the next request, 
   assert.deepEqual(before.events.filter((event) => event.startsWith('GET')), ['GET home']);
   assert.deepEqual(earlyCore.accountWrites, []);
   assert.equal(withoutMs(before.outcome.reason), 'disabled stage=list');
+});
+
+test('an account read switched off while the sources are read sends nothing, and still stores the read time', async () => {
+  // The served account block is switched off during the last read.
+  const web = site({ main: [listed(1, 1)] });
+  const core = rexCore();
+  const run = await pass(web, rexSpider({ summarize: true, account: () => (web.accountReads.length < SOURCES.length ? ACCOUNT_ON : { enabled: false }) }), { core, slept: () => 0 });
+  assert.deepEqual(accountRequests(run.events), SOURCES);
+  assert.deepEqual(accountsOf(run.sent), []);
+  assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(run.outcome.reason), 'ok seen=1 dispatched=1');
+  assert.ok(run.lines.includes('the account read was switched off before its record went out; nothing is sent'), run.lines.join('\n'));
+  // The spider is switched off during the last read.
+  const off = site({ main: [listed(1, 1)] });
+  const offCore = rexCore();
+  const stopped = await pass(off, rexSpider({ summarize: true, account: ACCOUNT_ON, enabled: () => off.accountReads.length < SOURCES.length }), { core: offCore, slept: () => 0 });
+  assert.deepEqual(accountRequests(stopped.events), SOURCES);
+  assert.deepEqual(accountsOf(stopped.sent), []);
+  assert.deepEqual(offCore.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }]);
+  assert.equal(withoutMs(stopped.outcome.reason), 'disabled stage=list');
 });
 
 test('an account hook that throws anywhere leaves the pass as it is with the account off, and is logged by the error\'s name', async () => {

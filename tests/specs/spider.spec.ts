@@ -88,10 +88,17 @@ const ACCOUNT_PATTERNS = [
   '^https://chatgpt.com/backend-api/memories$',
 ]
 
-test('the allowed URLs hold each account read to the end of its path, and none of them allows /backend-api/me', async ({ serviceWorker }) => {
+test('the allowed URLs are the pass\'s requests and the four account reads, each to the end of its path, and none of them allows /backend-api/me', async ({ serviceWorker }) => {
   const allowed = await serviceWorker.evaluate(() => self.rexChatGPTPlugin.allowedUrls())
   const allowing = (url) => allowed.filter((pattern) => new RegExp(pattern).test(url))
-  for (const pattern of ACCOUNT_PATTERNS) expect(allowed).toContain(pattern)
+  expect(allowed).toEqual([
+    '^https://chatgpt.com/$',
+    '^https://chatgpt.com/backend-api/conversations\\?.*',
+    '^https://chatgpt.com/backend-api/conversation/.*',
+    '^https://chatgpt.com/backend-api/gizmos/.*/conversations\\?.*',
+    '^https://chatgpt.com/backend-api/gizmos/snorlax/sidebar\\?.*',
+    ...ACCOUNT_PATTERNS,
+  ])
   for (const url of ['https://chatgpt.com/backend-api/me', 'https://chatgpt.com/backend-api/me?x=1', 'https://chatgpt.com/backend-api/memories/1', 'https://chatgpt.com/backend-api/settings/user/x']) {
     expect(allowing(url), url).toEqual([])
   }

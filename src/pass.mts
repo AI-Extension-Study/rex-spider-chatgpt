@@ -649,7 +649,8 @@ async function readSource(pass: Pass, client: Pick<Client, 'get'>, url: string):
   }
   const verdict = classify(answer);
   if (verdict === 'rate-limited' || verdict === 'challenge' || verdict === 'signed-out' || answer.status === 403) {
-    pass.say(`an account read was refused (${verdict}, status ${answer.status}); the account reads stop and nothing is sent`);
+    // A 403 with no challenge classifies as refused, which says nothing here.
+    pass.say(`an account read was refused (${verdict === 'refused' ? 'forbidden' : verdict}, status ${answer.status}); the account reads stop and nothing is sent`);
     return { stop: true };
   }
   if (verdict !== 'ok') {
@@ -677,6 +678,12 @@ async function sendAccount(pass: Pass, answers: Readonly<Record<string, AccountA
     if (!shouldSend(last, hash, readAt)) {
       return null;
     }
+    // The served flags as of now, since a refresh during the paced reads may
+    // have switched the account read, or the spider, off.
+    if (!pass.deps.framework.account().enabled || !pass.deps.framework.isEnabled()) {
+      pass.say('the account read was switched off before its record went out; nothing is sent');
+      return null;
+    }
     // A shallow copy: the record's interface has no index signature.
     pass.deps.dispatch({ ...record });
     return { hash, sentAt: readAt, readAt };
@@ -689,8 +696,9 @@ async function sendAccount(pass: Pass, answers: Readonly<Record<string, AccountA
 // The account read, between the home page and the list walk: off unless
 // served on, and made only when due (account.mts). Each source is read
 // crawl_delay after the request before it, with the token. A record goes out
-// when a source gave an answer to build from and the record changed, or the
-// last went out a day ago; the state that says so is stored after the settle
+// when a source gave an answer to build from, the record changed or the last
+// went out a day ago, and both the account read and the spider are still
+// switched on; the state that says so is stored after the settle
 // wait, so the record is stored first. The read time is stored after any
 // read, even one stopped or one whose record could not be built or sent, so
 // a lasting failure is read again only after the interval. It never throws,

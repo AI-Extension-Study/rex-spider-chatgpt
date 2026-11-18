@@ -270,6 +270,22 @@ test('a plan or a model slug that holds an id is null, or left out of metadata, 
   }
 });
 
+test('a plan or a model slug of more than 40 characters is null, or left out of metadata, and one of 40 is kept', () => {
+  const answers = accountAnswers();
+  const slugs = at(settingsOf(answers), 'last_used_model_config', 'slugs');
+  // z is no hex digit, so only the length can refuse these.
+  theAccount(answers).plan_type = 'z'.repeat(41);
+  slugs.web = 'z'.repeat(41);
+  let record = build(answers);
+  assert.equal(record.plan, null);
+  assert.equal('last_used_model' in record.metadata, false);
+  theAccount(answers).plan_type = 'z'.repeat(40);
+  slugs.web = 'z'.repeat(40);
+  record = build(answers);
+  assert.equal(record.plan, 'z'.repeat(40));
+  assert.equal(record.metadata.last_used_model, 'z'.repeat(40));
+});
+
 test('the account is the first one not under default, wherever default comes', () => {
   const answers = accountAnswers();
   const accounts = at(answers.accounts_check.body, 'accounts');
@@ -384,6 +400,14 @@ test('a metadata value of the wrong form is left out, and the rest kept', () => 
   assert.equal(build(answers).metadata.memories, 0);
 });
 
+test('a count of saved memories over 1e6 is left out of metadata, and 1e6 is kept', () => {
+  const answers = accountAnswers();
+  (answers.memories.body as Json).memories = new Array(1_000_001);
+  assert.equal('memories' in build(answers).metadata, false);
+  (answers.memories.body as Json).memories = new Array(1_000_000);
+  assert.equal(build(answers).metadata.memories, 1_000_000);
+});
+
 // --- hasUsableAnswer ---
 
 test('a record has something to send only when a source answered 200 with an object', () => {
@@ -427,6 +451,17 @@ test('the hash is SHA-256 of the record without date, keys sorted at every level
     + '"metadata":{"connector_search_enabled":null,"will_renew":true},"name":"rex-account","paid":null,"plan":"free","platform":"chatgpt",'
     + '"source_status":{"accounts_check":-1,"settings_user":200},"training_allowed":null,"web_search_enabled":null,"workspace":null}';
   assert.equal(await accountHash(record), createHash('sha256').update(text).digest('hex'));
+});
+
+test('the hash rejects when the digest fails or gives a digest of another form, so no record goes out without one', async (t) => {
+  const record = build(accountAnswers());
+  const digest = t.mock.method(crypto.subtle, 'digest', async (): Promise<ArrayBuffer> => {
+    throw new Error('no digest');
+  });
+  await assert.rejects(accountHash(record), /the account hash failed/);
+  // 16 bytes: hex, but not a SHA-256.
+  digest.mock.mockImplementation(async () => new ArrayBuffer(16));
+  await assert.rejects(accountHash(record), /the account hash failed/);
 });
 
 test('the hash ignores the read time and key order, and changes with any value', async () => {
