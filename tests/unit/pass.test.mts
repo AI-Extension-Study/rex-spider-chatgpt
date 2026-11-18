@@ -1314,33 +1314,52 @@ test('a refusal keeps the hash and send time of the last record sent', async () 
   assert.deepEqual(core.accountWrites, [{ ...stored, readAt: NOW }]);
 });
 
-// A page fetch reached by following a redirect: a sign-in page, or whatever
-// page a browser rule sent the request on to, which can answer JSON too.
-const SIGN_IN: Answer = { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} Log in</html>`, redirected: false };
-const REDIRECT_LINE = 'an account read was redirected; the account reads stop and nothing is sent';
+// A hash deadline no loaded machine misses, for the tests that compare the
+// records of two passes: at the harness's 50 ms, a slow hash leaves a
+// title_hash null on one side only.
+const STEADY: Partial<PassLimits> = { hashMs: 10_000 };
 
-test('an account answer the browser reached through a redirect stops the account reads and sends nothing; the read time is stored, and the pass is as with the account off', async () => {
-  const off = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { slept: () => 0 });
-  // Sent on to a sign-in page, or to a page that answers 200 with the
-  // source's own JSON, which would otherwise be read as the source's.
-  const pages = (source: string): [string, Record<string, Reply>][] => [['a sign-in page', { [source]: SIGN_IN }], ['a JSON page', {}]];
+// A sign-in page as the site serves it. Its own redirected is false, like
+// every page here: what makes a run's answer redirected is the run's
+// redirected option, which the real client reads from Response.redirected.
+const SIGN_IN: Answer = { status: 200, headers: { 'content-type': 'text/html' }, text: `<html>${MARK} Log in</html>`, redirected: false };
+const redirectLine = (status: number): string => `an account read was redirected (status ${status}); the account reads stop and nothing is sent`;
+
+test('an account answer the browser reached through a redirect stops the account reads and sends nothing; the read time is stored, and the pass and its back-off are as with the account off', async () => {
+  // A back-off that has run out, which a pass that reads a list page with no
+  // refusal clears: the account read must neither keep nor renew it.
+  const expired: BackoffState = { until: NOW - 1000, failures: 2, code: 'rate-limited' };
+  const offCore = rexCore({ backoff: expired });
+  const off = await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true }), { core: offCore, slept: () => 0, limits: STEADY });
+  assert.deepEqual(offCore.backoffWrites, [null]);
+  // The page the redirect landed on: a sign-in page, a page that answers 200
+  // with the source's own JSON (which would otherwise be read as the
+  // source's), or an error page, which would otherwise be that source's own
+  // failure and leave the other reads going.
+  const pages = (source: string): [string, number, Record<string, Reply>][] => [
+    ['a sign-in page', 200, { [source]: SIGN_IN }],
+    ['a JSON page', 200, {}],
+    ['a 404 page', 404, { [source]: failing(404) }],
+    ['a 500 page', 500, { [source]: failing(500) }],
+  ];
   for (const source of SOURCES) {
-    for (const [what, account] of pages(source)) {
+    for (const [what, status, account] of pages(source)) {
       const name = `${what} for ${source}`;
-      const core = rexCore();
-      const run = await pass(site({ main: [listed(1, 1)], account }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, redirected: [source] });
+      const core = rexCore({ backoff: expired });
+      const run = await pass(site({ main: [listed(1, 1)], account }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, limits: STEADY, redirected: [source] });
       assert.deepEqual(accountRequests(run.events), SOURCES.slice(0, SOURCES.indexOf(source) + 1), name);
       assert.deepEqual(accountsOf(run.sent), [], name);
       assert.deepEqual(run.outcome, off.outcome, name);
       assert.deepEqual(run.sent, off.sent, name);
+      assert.deepEqual(core.backoffWrites, offCore.backoffWrites, name);
       assert.deepEqual(core.accountWrites, [{ hash: '', sentAt: 0, readAt: NOW }], name);
-      assert.ok(run.lines.includes(REDIRECT_LINE), `${name}\n${run.lines.join('\n')}`);
+      assert.ok(run.lines.includes(redirectLine(status)), `${name}\n${run.lines.join('\n')}`);
     }
   }
   // A record sent before keeps its hash and send time.
   const stored: AccountState = { hash: 'b'.repeat(64), sentAt: NOW - 3 * DAY, readAt: NOW - 2 * 60 * MINUTE };
   const core = rexCore({ account: stored });
-  await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, redirected: ['settings_user'] });
+  await pass(site({ main: [listed(1, 1)] }), rexSpider({ summarize: true, account: ACCOUNT_ON }), { core, slept: () => 0, limits: STEADY, redirected: ['settings_user'] });
   assert.deepEqual(core.accountWrites, [{ ...stored, readAt: NOW }]);
 });
 
@@ -1348,8 +1367,8 @@ test('the home page, the list walk and the detail reads take a redirected answer
   const everything = ['home', 'main 0', 'main 28', 'archived 0', 'starred 0', 'sidebar', 'project', `detail ${chat(1)}`, `detail ${chat(2)}`];
   for (const summarize of [true, false]) {
     const options: SiteOptions = { main: [listed(1, 1), listed(2, 2)], projects: { [PROJECT]: [] } };
-    const plain = await pass(site(options), rexSpider({ summarize }), { slept: () => 0 });
-    const redirected = await pass(site(options), rexSpider({ summarize }), { slept: () => 0, redirected: everything });
+    const plain = await pass(site(options), rexSpider({ summarize }), { slept: () => 0, limits: STEADY });
+    const redirected = await pass(site(options), rexSpider({ summarize }), { slept: () => 0, limits: STEADY, redirected: everything });
     assert.match(plain.outcome.reason, /^ok seen=2 dispatched=2 /, `summarize ${summarize}`);
     assert.deepEqual(redirected.outcome, plain.outcome, `summarize ${summarize}`);
     assert.deepEqual(redirected.events, plain.events, `summarize ${summarize}`);
