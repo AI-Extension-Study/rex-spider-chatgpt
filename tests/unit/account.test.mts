@@ -34,7 +34,7 @@ const systemOf = (answers: Record<string, FixtureAnswer>): Json => answers.user_
 // The builder, each record checked for any value of the answers that must
 // not be sent, whatever the test.
 function build(answers: Record<string, FixtureAnswer>): AccountRecord {
-  const record = buildChatGPTAccount(answers, NOW);
+  const record = buildChatGPTAccount(answers, NOW, 1);
   assert.equal(JSON.stringify(record).includes(MARK), false, 'a value of the answers is in the record');
   return record;
 }
@@ -153,7 +153,7 @@ test('the four answers of 2026-11-17 give that day\'s record, with no id, name o
 test('the record holds the standard keys, in their order, and nothing else', () => {
   assert.deepEqual(Object.keys(build(accountAnswers())), STANDARD_KEYS);
   // Every source failed: still every key.
-  const failed = buildChatGPTAccount({}, NOW);
+  const failed = buildChatGPTAccount({}, NOW, 1);
   assert.deepEqual(Object.keys(failed), STANDARD_KEYS);
   assert.deepEqual(failed.source_status, { user_system_messages: -1, accounts_check: -1, settings_user: -1, memories: -1 });
   assert.deepEqual(failed.metadata, {});
@@ -490,4 +490,24 @@ test('the hash ignores the read time and key order, and changes with any value',
   assert.notEqual(await accountHash({ ...record, memory_enabled: false }), hash);
   assert.notEqual(await accountHash({ ...record, metadata: { ...record.metadata, memories: MEMORY_COUNT + 1 } }), hash);
   assert.notEqual(await accountHash({ ...record, source_status: { ...record.source_status, memories: 500 } }), hash);
+});
+
+test('a record built under format 2 says format_version 2, and is otherwise the format 1 record', () => {
+  const formatOne = buildChatGPTAccount(accountAnswers(), NOW, 1);
+  const formatTwo = buildChatGPTAccount(accountAnswers(), NOW, 2);
+  assert.equal(formatTwo.format_version, 2);
+  assert.deepEqual(Object.keys(formatTwo), STANDARD_KEYS);
+  assert.deepEqual({ ...formatTwo, format_version: 1 }, formatOne);
+  assert.equal(JSON.stringify(formatTwo).includes(MARK), false);
+});
+
+test('the hash differs between format 1 and format 2 of the same answers, so the first read under format 2 sends its record', async () => {
+  const formatOne = await accountHash(buildChatGPTAccount(accountAnswers(), NOW, 1));
+  const formatTwo = await accountHash(buildChatGPTAccount(accountAnswers(), NOW, 2));
+  assert.notEqual(formatTwo, formatOne);
+  // Sent under format 1 an hour ago: the same record would wait for the day,
+  // the format 2 one goes now.
+  const last: AccountState = { hash: formatOne, sentAt: NOW - HOUR, readAt: NOW - HOUR };
+  assert.equal(shouldSend(last, formatOne, NOW), false);
+  assert.equal(shouldSend(last, formatTwo, NOW), true);
 });

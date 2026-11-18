@@ -1,8 +1,8 @@
 # rex-spider-chatgpt
 
-The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow format 1, the conversation record layout the Gemini fork also uses. Where the served configuration turns it on, it also sends a `rex-account` record of the account's plan and settings (see "The account record").
+The ChatGPT crawler for a research browser extension (this fork of bric-digital's `rex-spider-chatgpt`). While a participant's browser is open and signed in to chatgpt.com, it reads the account's ChatGPT chats with the participant's own sign-in and uploads one record for each new or changed chat. A summary record holds the chat's times, a few flags and hashes of its title and ids. A detail record adds one turn per prompt and per reply, with counts made in the browser: characters, words, citations, search results and attached files. No record holds a title or message text. Records follow the conversation record layout the Gemini fork also uses, and carry the data format the served configuration names (1 when it names none; see "The data format"). Where the served configuration turns it on, it also sends a `rex-account` record of the account's plan and settings (see "The account record").
 
-**Where it stands, 2026-11-13.** The code described here is `74712d8`. The extension installs this fork at `74712d8` from its release v0.0.59 (2026-11-13) on. The account record (see "The account record") is newer: it is on `main` from the merge that closes #21, and no extension build pins it yet.
+**Where it stands, 2026-11-18.** The extension's release v0.0.59 (2026-11-13) installs this fork at `74712d8`. `main` is newer, and no extension release ships it yet. It adds the account record (see "The account record"), from the merge that closes #21, which the extension's `main` pins at `9b595f1`; and the data format (see "The data format"), which arrives with the extension's next pin of this fork. Until then every browser runs a commit that ignores `data_format` and sends format 1.
 
 ## What it collects
 
@@ -29,7 +29,7 @@ Detail reads stop once a pass has spent 360 s reading (requests, parsing and sto
 
 ## What a record holds
 
-Top level: `name` (`rex-conversation`), `platform` (`chatgpt`), `identifier` (the chat id, a UUID), `format_version` (`1`), `is_summary`, `date`, `started`, `ended`, `turns`, `metadata`. In a summary record, `started` and `ended` are the list's `create_time` and `update_time`, `date` is `ended` in epoch ms, and `turns` is empty. A detail record has `started` from the chat's creation, `ended` from its latest message, `date` from `started` (else `ended`) in epoch ms, and adds `turns_complete` and `user_agent`: `Browser` when the root of the chat's tree is `client-created-root`, the root the web page makes, else `App (Mobile or Desktop)`.
+Top level: `name` (`rex-conversation`), `platform` (`chatgpt`), `identifier` (the chat id, a UUID), `format_version` (the data format), `is_summary`, `date`, `started`, `ended`, `turns`, `metadata`. In a summary record, `started` and `ended` are the list's `create_time` and `update_time`, `date` is `ended` in epoch ms, and `turns` is empty. A detail record has `started` from the chat's creation, `ended` from its latest message, `date` from `started` (else `ended`) in epoch ms, and adds `turns_complete` and `user_agent`: `Browser` when the root of the chat's tree is `client-created-root`, the root the web page makes, else `App (Mobile or Desktop)`.
 
 `metadata` in a summary record: `create_time`, `update_time`, `is_archived`, `is_starred`, `pinned_time`, `is_temporary_chat`, `is_do_not_remember`, `memory_scope`, `async_status`, `title_hash`, `gizmo_id_hash`, `conversation_template_id_hash`. In a detail record: `conversation_id`, `create_time`, `update_time`, `default_model_slug`, `is_archived`, `is_starred`, `pinned_time`, `is_temporary_chat`, `is_do_not_remember`, `memory_scope`, `is_study_mode`, `current_node`, `gizmo_type`, the three hashes, and `mapping`. The times in `metadata` are ISO strings in a summary and epoch seconds in a detail record, as ChatGPT sends them. `is_starred` is `true` or null, never `false`.
 
@@ -64,7 +64,7 @@ Off unless the served configuration has `account: {"enabled": true}` for this sp
 
 `/backend-api/me` is never requested: it holds the email, the name and the phone number.
 
-Every record has, in this order: `name` (`rex-account`), `platform` (`chatgpt`), `format_version` (`1`), `date` (the read, epoch ms), `plan`, `paid`, `workspace` (`personal`, `team`, `enterprise` or `edu`), `web_search_enabled`, `training_allowed`, `history_saved` (always null: ChatGPT has no such setting), `memory_enabled`, `custom_instructions_set`, `account_created`, `source_status` (each source's HTTP status, -1 for no answer) and `metadata`. A key is null when its source did not answer 200 with a JSON object, the site has no such key, or the value has the wrong form. `plan` must match `^[a-z0-9][a-z0-9_. -]{0,39}$` and `last_used_model` `^[a-z0-9][a-z0-9.-]{0,39}$` with no leading `g-` (a custom GPT's or a project's id), and neither may hold a UUID-like run or 12 hex digits in a row. Times are ISO 8601 instants in UTC ending in `Z`. A metadata value of the wrong form is left out; `cancels_at` and `renews_at` keep the site's null.
+Every record has, in this order: `name` (`rex-account`), `platform` (`chatgpt`), `format_version` (the data format), `date` (the read, epoch ms), `plan`, `paid`, `workspace` (`personal`, `team`, `enterprise` or `edu`), `web_search_enabled`, `training_allowed`, `history_saved` (always null: ChatGPT has no such setting), `memory_enabled`, `custom_instructions_set`, `account_created`, `source_status` (each source's HTTP status, -1 for no answer) and `metadata`. A key is null when its source did not answer 200 with a JSON object, the site has no such key, or the value has the wrong form. `plan` must match `^[a-z0-9][a-z0-9_. -]{0,39}$` and `last_used_model` `^[a-z0-9][a-z0-9.-]{0,39}$` with no leading `g-` (a custom GPT's or a project's id), and neither may hold a UUID-like run or 12 hex digits in a row. Times are ISO 8601 instants in UTC ending in `Z`. A metadata value of the wrong form is left out; `cancels_at` and `renews_at` keep the site's null.
 
 Never in the record: emails, names, phone numbers, ids of any kind (account, user, subscription, organization), organization names, billing details, the text of custom instructions or memories (only whether any instruction is written, and how many memories), and the home page line the token comes from. `src/redact.mts` and `src/keep.mts` cover `rex-conversation` records only; the extension checks a `rex-account` record against its own allow-list.
 
@@ -80,10 +80,20 @@ Never in the record: emails, names, phone numbers, ids of any kind (account, use
 
 Each mode has its own upload key: the bare chat id in summary mode, the key earlier builds wrote for both modes, and `<chat id>-detail` in detail mode. A chat with a key in the served mode at its current list time is not sent again, and one with no key in either mode is sent. The spider stores the served mode and when this browser's first pass in it ran (`rex-spider-chatgpt-mode`). A chat with a key only in the other mode is sent again, once, if its last change is no earlier than 90 days before that pass; older chats keep the record they have. A browser with no stored mode counts as switching on its first pass. So an update to this build sends nothing again where summary mode is served, and where detail mode is served it sends the chats changed in the 90 days before, once, as detail records.
 
+## The data format
+
+`data_format` in the served block is one number for the layout of every record the spider sends: each conversation record and the account record carry it as `format_version`. Absent, or anything but an integer from 1 to 999, it is 1, the layout and keys of the builds before the setting existed. The spider takes it again at every configuration refresh, and a pass reads it once, when it starts; one served during a pass applies from the next.
+
+Format 1 keeps the upload keys above. A later format n adds `-f<n>` to both: `<chat id>-f<n>` in summary mode and `<chat id>-detail-f<n>` in detail mode. So when the served format changes, no chat in the crawl window has a key under the new one, and the following passes send every chat in the window once, in the served mode, whenever it was last used: the 90-day limit of a mode switch does not apply. Within one format, a switch of mode works as above, on that format's keys only. The account record's hash includes `format_version`, so the first account read under a new format sends a record. That read comes once `interval_minutes` have passed since the last one, so up to that long after the first pass under the new format (60 minutes by default).
+
+The wait after a failed detail read (see "When something fails") is kept per format too, under `rex-spider-chatgpt-detail-memo-<chat id>` in format 1 and `...-f<n>` after. So a chat whose detail read failed before the change is read again at the first pass under the new format, and a read that fails then sends its summary in its place, under the new format.
+
+The old format's upload keys and memos stay in the extension's store after a change of format. Nothing reads, writes or clears them again, so they hold nothing back; they are one small value per chat sent, and per chat whose read failed.
+
 ## What is removed, and how
 
 1. The spider builds each record from the keys above and nothing else, each value in a checked form: a time must read as a time, and a label must be a type name (lowercase letters, digits, `_`, `.` and `-`, at most 64 characters). Any other value becomes null, or `unrecognised` where a label was expected. The title and the gizmo and template ids are hashed with SHA-256 in the spider, and the counts are made in the browser, so no text leaves the spider.
-2. The extension runs the redactor, `src/redact.mts` with its tables in `src/keep.mts`, on every `rex-conversation` record with `platform` `chatgpt` before upload. A record the spider built comes back key for key, each value written again from its checked form, and anything else is dropped at every level. The redactor also holds every id to one form, a UUID or `client-created-root` for the root of a tree: an id in another form reads null, and a tree entry under such a key is dropped, which makes `turns_complete` false. Any other such record keeps only `date`, `name`, `platform`, `identifier` (a UUID) and the uploader's own keys (`generatorId`, `_pdk_trace_context`, `passive-data-metadata`). The redactor never throws, because rex-content-processing uploads a failed processor's input unredacted. Completion events are not filtered.
+2. The extension runs the redactor, `src/redact.mts` with its tables in `src/keep.mts`, on every `rex-conversation` record with `platform` `chatgpt` before upload, with the data format the extension accepts. A record the spider built under that format comes back key for key, each value written again from its checked form, and anything else is dropped at every level. The redactor also holds every id to one form, a UUID or `client-created-root` for the root of a tree: an id in another form reads null, and a tree entry under such a key is dropped, which makes `turns_complete` false. Any other such record, one of another format included, keeps only `date`, `name`, `platform`, `identifier` (a UUID) and the uploader's own keys (`generatorId`, `_pdk_trace_context`, `passive-data-metadata`). The redactor never throws, because rex-content-processing uploads a failed processor's input unredacted. Completion events are not filtered.
 
 The hashes use no secret key, so someone who guesses a title exactly can confirm the guess, and two chats with the same title share a hash.
 
@@ -91,7 +101,7 @@ The hashes use no secret key, so someone who guesses a title exactly can confirm
 
 - A 429, a 503, any `Retry-After` header, or a Cloudflare challenge stops the pass and starts a back-off kept in the extension's storage: 5 minutes, doubling with each refusal in a row, longer if `Retry-After` asks, at most 6 hours. Passes during it end at once with no request. A pass that reads a list page with no refusal clears it.
 - No token on the home page, or a 401, ends the pass with no back-off; the next pass reads the token again.
-- Any other failed detail read is that chat's alone. Its summary record goes out in the detail's place, once per list time, unless one already went out at that time. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a page that is not JSON) and 7 days otherwise; a chat that changes is read at once. Failed reads also end the pass's reads, as `halt_on_error` sets (see "Settings it reads").
+- Any other failed detail read is that chat's alone. Its summary record goes out in the detail's place, once per list time, unless one already went out at that time under the same data format. The chat then waits 1 day before the next try after a first failure that may pass by itself (no answer, a 5xx, a page that is not JSON) and 7 days otherwise; a chat that changes is read at once. Failed reads also end the pass's reads, as `halt_on_error` sets (see "Settings it reads").
 
 ## Reading the completion events
 
@@ -124,6 +134,7 @@ rex-spider merges `spider.spiders.chatgpt` over `spider.spiders.default` from th
 | `sleep_delay` | `300000` | ms between passes, applied by rex-spider |
 | `start`, `end`, `time_anchor` | none, none, `runtime` | the crawl window: `start` and `end` in ms from the install time (`install`) or from now (`runtime`), or as epoch ms (`absolute`); a chat is in it by its list `update_time` |
 | `account` | absent (off) | `{"enabled": true}` turns the account read on; `interval_minutes`, an integer from 15 to 1440 (else 60), is the time between reads. A `chatgpt` block's `account` replaces the `default` block's whole |
+| `data_format` | absent (1) | an integer from 1 to 999 is the data format the records carry and the upload keys are built for; anything else is 1 (see "The data format") |
 
 ## What it cannot see
 
@@ -137,7 +148,7 @@ Node 24.11 or later. `npm ci`, then `npm run lint` and `npm run test:unit` (Node
 
 ## How a change reaches the extension
 
-The extension installs this module from a pinned commit and carries a copy of `src/redact.mts` and `src/keep.mts` from that commit as its ChatGPT case. A change here reaches participants only after the extension pins the new commit, its copy of the two files is made again from that commit, and a release ships both.
+The extension installs this module from a pinned commit and carries a copy of `src/redact.mts` and `src/keep.mts` from that commit as its ChatGPT case, which it calls with the data format it accepts. A change here reaches participants only after the extension pins the new commit, its copy of the two files is made again from that commit, and a release ships both.
 
 ## Where to read next
 
@@ -160,4 +171,4 @@ The extension installs this module from a pinned commit and carries a copy of `s
 
 ## Keeping this current
 
-A pull request that changes what a record holds, what is removed, which lists or account sources are read, the pace, the reasons or the settings updates this README in the same pull request.
+A pull request that changes what a record holds, what is removed, which lists or account sources are read, the pace, the reasons, the settings or the keys updates this README in the same pull request.

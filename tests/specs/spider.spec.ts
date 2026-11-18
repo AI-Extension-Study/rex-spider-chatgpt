@@ -80,6 +80,32 @@ test('the account setting takes effect both ways on every configuration update, 
   })
 })
 
+test('the data format takes effect both ways on every configuration update, directly and through rex-spider\'s refresh, and anything but an integer from 1 to 999 is 1', async ({ serviceWorker }) => {
+  const seen = await serviceWorker.evaluate(() => {
+    const spider = self.rexChatGPTPlugin
+    const direct = []
+    for (const configuration of [
+      { data_format: 2 }, {}, { data_format: 999 }, { data_format: 0 }, { data_format: -1 }, { data_format: 1.5 }, { data_format: '2' }, { data_format: null },
+      { data_format: 1000 }, { data_format: NaN }, { data_format: 3 },
+    ]) {
+      spider.updateConfiguration(configuration)
+      direct.push(spider.dataFormat())
+    }
+    const refreshed = []
+    for (const spiders of [
+      { default: { data_format: 2 } },
+      { default: { data_format: 2 }, chatgpt: { enabled: true, data_format: 3 } },
+      { default: { data_format: 2 }, chatgpt: { enabled: true } },
+      { chatgpt: { enabled: true } },
+    ]) {
+      self.rexSpiderPlugin.updateConfiguration({ spiders })
+      refreshed.push(spider.dataFormat())
+    }
+    return { direct, refreshed }
+  })
+  expect(seen).toEqual({ direct: [2, 1, 999, 1, 1, 1, 1, 1, 1, 1, 3], refreshed: [2, 3, 2, 1] })
+})
+
 // The four account reads, as the spider's allowed URLs name them.
 const ACCOUNT_PATTERNS = [
   '^https://chatgpt.com/backend-api/user_system_messages$',
@@ -267,6 +293,35 @@ test('served account enabled, a crawl reads the four account sources after the h
   expect(records).toHaveLength(1)
   expect(completions.at(-1)).toMatchObject({ crawled_count: 1, crawled_ids: [CHAT] })
   expect(completions.at(-1).reason).toMatch(/^ok seen=1 dispatched=1 ms=\d+$/)
+})
+
+// What rex-core holds under a key, as it answers a fetchValue: null when
+// nothing is stored.
+async function storedValue(serviceWorker, key) {
+  return serviceWorker.evaluate((key) => new Promise((resolve) => {
+    self.rexCorePlugin.handleMessage({ messageType: 'fetchValue', key }, null, resolve)
+  }), key)
+}
+
+// The upload key rex-spider stores for an id at the chat's list time, the
+// main list's update_time in onePass, in epoch ms.
+const uploadKey = (id) => `rex-spider-chatgpt-conversation-upload-${id}-${(T0 + 2) * 1000}`
+
+// Each completion of the crawls so far: one chat seen and sent.
+const completionsOk = (completions) => completions.map((details) => /^ok seen=1 dispatched=1 ms=\d+$/.test(details.reason))
+
+test('a served data_format 2 makes the next pass key its chat with -f2 and send format 2 records; a block without it keys today\'s ids', async ({ serviceWorker }) => {
+  const formatTwo = await onePass(serviceWorker, { summarize: false, data_format: 2, account: { enabled: true } })
+  expect(formatTwo.records.map((record) => record.format_version)).toEqual([2])
+  expect(formatTwo.accounts.map((account) => account.format_version)).toEqual([2])
+  expect(await storedValue(serviceWorker, uploadKey(`${CHAT}-detail-f2`))).not.toBeNull()
+  expect(await storedValue(serviceWorker, uploadKey(`${CHAT}-detail`))).toBeNull()
+  // The same chat, with no data_format served: unsent under today's id, so
+  // it goes out again as format 1.
+  const formatOne = await onePass(serviceWorker, { summarize: false })
+  expect(formatOne.records.map((record) => record.format_version)).toEqual([2, 1])
+  expect(await storedValue(serviceWorker, uploadKey(`${CHAT}-detail`))).not.toBeNull()
+  expect(completionsOk(formatOne.completions)).toEqual([true, true])
 })
 
 test('a crawl started while a pass runs starts no second pass, and the spider says it is crawling from the first moment', async ({ serviceWorker }) => {

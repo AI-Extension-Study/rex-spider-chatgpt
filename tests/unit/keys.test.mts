@@ -17,16 +17,36 @@ const CHAT = '00000000-0000-4000-8000-000000000001';
 const rexSpiderKey = (id: string, updated: DateString) => `rex-spider-chatgpt-conversation-upload-${id}-${Math.round(updated.timestamp())}`;
 
 test('summary mode keeps the bare chat id, the key earlier builds wrote; detail mode adds -detail', () => {
-  assert.equal(uploadKeyId('c1', true), 'c1');
-  assert.equal(uploadKeyId('c1', false), 'c1-detail');
-  assert.equal(uploadKeyId(CHAT, true), CHAT);
-  assert.equal(uploadKeyId(CHAT, false), `${CHAT}-detail`);
+  assert.equal(uploadKeyId('c1', true, 1), 'c1');
+  assert.equal(uploadKeyId('c1', false, 1), 'c1-detail');
+  assert.equal(uploadKeyId(CHAT, true, 1), CHAT);
+  assert.equal(uploadKeyId(CHAT, false, 1), `${CHAT}-detail`);
 });
 
 test('the upload key rex-spider builds from it differs between the modes for one chat at one time', () => {
-  const key = (summary: boolean) => rexSpiderKey(uploadKeyId(CHAT, summary), new DateString('2026-09-08T13:49:43.781123Z'));
+  const key = (summary: boolean) => rexSpiderKey(uploadKeyId(CHAT, summary, 1), new DateString('2026-09-08T13:49:43.781123Z'));
   assert.equal(key(true), `rex-spider-chatgpt-conversation-upload-${CHAT}-1788875383781`);
   assert.equal(key(false), `rex-spider-chatgpt-conversation-upload-${CHAT}-detail-1788875383781`);
+});
+
+test('format 1 keeps today\'s ids; a later format adds -f and its number, so every chat is unsent under it', () => {
+  assert.equal(uploadKeyId('c', true, 1), 'c');
+  assert.equal(uploadKeyId('c', false, 1), 'c-detail');
+  assert.equal(uploadKeyId('c', true, 2), 'c-f2');
+  assert.equal(uploadKeyId('c', false, 2), 'c-detail-f2');
+  assert.equal(uploadKeyId('c', false, 999), 'c-detail-f999');
+  const key = (summary: boolean, format: number) => rexSpiderKey(uploadKeyId(CHAT, summary, format), new DateString('2026-09-08T13:49:43.781123Z'));
+  assert.equal(key(true, 2), `rex-spider-chatgpt-conversation-upload-${CHAT}-f2-1788875383781`);
+  assert.equal(key(false, 2), `rex-spider-chatgpt-conversation-upload-${CHAT}-detail-f2-1788875383781`);
+  // The four ids of one chat are four keys.
+  assert.equal(new Set([key(true, 1), key(false, 1), key(true, 2), key(false, 2)]).size, 4);
+});
+
+test('a format that is not an integer from 1 to 999 is refused, so no key is built from it', () => {
+  for (const format of [0, -1, 1.5, 1000, NaN, '2' as unknown as number, null as unknown as number, undefined as unknown as number]) {
+    assert.throws(() => uploadKeyId(CHAT, true, format), TypeError, String(format));
+    assert.throws(() => uploadKeyId(CHAT, false, format), TypeError, String(format));
+  }
 });
 
 // Summary keys must not change, or every browser sends its chats again on
@@ -83,7 +103,7 @@ async function walk(main: unknown[], project: unknown[]): Promise<Map<string, Li
 
 const summaryKey = (item: ListItem | undefined) => {
   assert.ok(item !== undefined, 'the walk did not list the chat');
-  return rexSpiderKey(uploadKeyId(item.id, true), uploadTime(item));
+  return rexSpiderKey(uploadKeyId(item.id, true, 1), uploadTime(item));
 };
 
 test('a main-list chat keeps the summary key the spider stores today, to the millisecond', async () => {
@@ -116,23 +136,33 @@ test('the mode record, the back-off, the account state and the memos sit under t
   assert.equal(MODE_KEY, 'rex-spider-chatgpt-mode');
   assert.equal(BACKOFF_KEY, 'rex-spider-chatgpt-backoff');
   assert.equal(ACCOUNT_KEY, 'rex-spider-chatgpt-account');
-  assert.equal(memoKey(CHAT), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+  assert.equal(memoKey(CHAT, 1), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+});
+
+test('a memo key, like an upload key id, keeps today\'s key under format 1 and adds -f and the format after', () => {
+  assert.equal(memoKey(CHAT, 1), `rex-spider-chatgpt-detail-memo-${CHAT}`);
+  assert.equal(memoKey(CHAT, 2), `rex-spider-chatgpt-detail-memo-${CHAT}-f2`);
+  assert.equal(memoKey(CHAT, 999), `rex-spider-chatgpt-detail-memo-${CHAT}-f999`);
+  for (const format of [0, -1, 1.5, 1000, NaN, '2' as unknown as number, undefined as unknown as number]) {
+    assert.throws(() => memoKey(CHAT, format), TypeError, String(format));
+  }
 });
 
 test('a memo key needs a chat id', () => {
-  assert.throws(() => memoKey(''), TypeError);
-  assert.throws(() => uploadKeyId('', true), TypeError);
+  assert.throws(() => memoKey('', 1), TypeError);
+  assert.throws(() => uploadKeyId('', true, 1), TypeError);
 });
 
 test('what may be logged of a key is its kind, never a chat id', () => {
   assert.equal(keyKind(MODE_KEY), 'rex-spider-chatgpt-mode');
   assert.equal(keyKind(BACKOFF_KEY), 'rex-spider-chatgpt-backoff');
   assert.equal(keyKind(ACCOUNT_KEY), 'rex-spider-chatgpt-account');
-  assert.equal(keyKind(memoKey(CHAT)), 'rex-spider-chatgpt-detail-memo');
+  assert.equal(keyKind(memoKey(CHAT, 1)), 'rex-spider-chatgpt-detail-memo');
+  assert.equal(keyKind(memoKey(CHAT, 2)), 'rex-spider-chatgpt-detail-memo');
   assert.equal(keyKind(`rex-spider-chatgpt-conversation-upload-${CHAT}-1788875383781`), 'other key');
 });
 
 test('a chat id that is not a string is refused at run time too', () => {
-  assert.throws(() => memoKey(123 as unknown as string), TypeError);
-  assert.throws(() => uploadKeyId(null as unknown as string, false), TypeError);
+  assert.throws(() => memoKey(123 as unknown as string, 1), TypeError);
+  assert.throws(() => uploadKeyId(null as unknown as string, false, 1), TypeError);
 });

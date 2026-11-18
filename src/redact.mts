@@ -1,23 +1,24 @@
 // The ChatGPT case of the extension's content processor, which calls it for
 // platform 'chatgpt' on every rex-conversation point before it is queued for
-// upload. A record buildSummaryRecord or buildDetailRecord made, in the
-// standard record layout (format 1), comes back equal, each value written
-// from its checked form (keep.mts) and every other key dropped, at every
-// level, but in two cases. An id outside the one id rule reads null, and a
-// mapping entry under such a key is dropped, which marks the turns
-// incomplete. A project list time outside 2001 to 2286 cuts the record to
-// the scaffold (asSeconds). Any other point keeps only the scaffold: the
-// fields the processor keeps for a point of no known platform, each in its
-// form. The case never throws, because rex-content-processing uploads a
-// failed processor's input unredacted. The extension carries a copy of this
-// file and keep.mts, so the two import nothing but rex-types. Pure.
+// upload, with the data format the extension accepts. A record
+// buildSummaryRecord or buildDetailRecord made under that format, in the
+// standard record layout, comes back equal, each value written from its
+// checked form (keep.mts) and every other key dropped, at every level, but in
+// two cases. An id outside the one id rule reads null, and a mapping entry
+// under such a key is dropped, which marks the turns incomplete. A project
+// list time outside 2001 to 2286 cuts the record to the scaffold (asSeconds).
+// Any other point, a record of another format among them, keeps only the
+// scaffold: the fields the processor keeps for a point of no known platform,
+// each in its form. The case never throws, because rex-content-processing
+// uploads a failed processor's input unredacted. The extension carries a copy
+// of this file and keep.mts, so the two import nothing but rex-types, and the
+// format comes from the extension rather than a constant here. Pure.
 import { DateString } from '@bric/rex-types/types';
 
 import { DETAIL_METADATA, INSTANT_TO_STRING, REPLY, SUMMARY_METADATA, TURN, asListTime, asSeconds, asUuid, isObject, keepAll, keepMapping, ownField } from './keep.mts';
 
 const NAME = 'rex-conversation';
 const PLATFORM = 'chatgpt';
-const FORMAT_VERSION = 1;
 const USER_AGENTS: ReadonlySet<string> = new Set(['Browser', 'App (Mobile or Desktop)']);
 
 // The form the scaffold keeps a name, a platform or a generator id in: PDK's
@@ -89,8 +90,12 @@ function keepTurn(turn: Readonly<Record<string, unknown>>): Record<string, unkno
   return kept.speaker === null || kept.nodes === null ? null : kept;
 }
 
-/** The record for a record the builders made, else the scaffold; never throws. */
-export function redactChatGPT(event: Record<string, unknown>): Record<string, unknown> {
+/**
+ * The record for a record the builders made under the format given, else the
+ * scaffold; never throws. A format that is not an integer matches no record,
+ * not even one with no format_version.
+ */
+export function redactChatGPT(event: Record<string, unknown>, format: number): Record<string, unknown> {
   const fields = Object.fromEntries(FIELDS.map((key) => [key, readOwn(event, key)]));
   const scaffold = Object.fromEntries(Object.entries(SCAFFOLD).filter(([key, holds]) => holds(fields[key])).map(([key]) => [key, fields[key]]));
   try {
@@ -100,7 +105,7 @@ export function redactChatGPT(event: Record<string, unknown>): Record<string, un
     const shaped = isSummary === true
       ? Array.isArray(turns) && turns.length === 0 && complete === undefined
       : isSummary === false && Array.isArray(turns) && typeof complete === 'boolean' && typeof agent === 'string' && USER_AGENTS.has(agent);
-    if (name !== NAME || platform !== PLATFORM || asUuid(identifier) === null || version !== FORMAT_VERSION || !shaped || !isObject(metadata)) {
+    if (name !== NAME || platform !== PLATFORM || asUuid(identifier) === null || !Number.isInteger(version) || version !== format || !shaped || !isObject(metadata)) {
       return scaffold;
     }
     const ended = sourceOf(fields.ended);
@@ -110,7 +115,7 @@ export function redactChatGPT(event: Record<string, unknown>): Record<string, un
       return scaffold;
     }
     const head = {
-      ...scaffold, format_version: FORMAT_VERSION, is_summary: isSummary, ...(started === undefined ? {} : { started: new DateString(started) }), ended: new DateString(ended),
+      ...scaffold, format_version: format, is_summary: isSummary, ...(started === undefined ? {} : { started: new DateString(started) }), ended: new DateString(ended),
     };
     if (isSummary) {
       return { ...head, turns: [], metadata: keepAll(SUMMARY_METADATA, metadata) };

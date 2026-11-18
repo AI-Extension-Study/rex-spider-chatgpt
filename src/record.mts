@@ -1,19 +1,18 @@
 // The rex-conversation records the spider sends, in the shared conversation
-// record layout (format 1): a summary record from a list item, and a detail
-// record from a chat's detail and its list item. Nothing in them is text from
+// record layout: a summary record from a list item, and a detail record from
+// a chat's detail and its list item, each stamped with the data format it is
+// built under (format.mts) as its format_version. Nothing in them is text from
 // a chat or its list: a detail record's turns hold counts, its metadata the
 // conversation's content-free keys and the content-free skeleton of its
 // tree, and the title and the project ids go out as SHA-256 hashes made with
 // the hash handed in. The builders read no configuration and say nothing of
-// the account as a whole: summary or detail is the caller's choice. Pure but
-// for the hash.
+// the account as a whole: summary or detail, and the format, are the
+// caller's choice. Pure but for the hash.
 import { type DateString } from '@bric/rex-types/types';
 
 import { parseDetail } from './detail.mts';
 import { field, flag, instantOf, isObject, isPlausibleSeconds, secondsOrNull, typeName } from './forms.mts';
 import { type ListItem, uploadTime } from './list.mts';
-
-export const FORMAT_VERSION = 1;
 
 const NAME = 'rex-conversation';
 const PLATFORM = 'chatgpt';
@@ -46,7 +45,7 @@ export async function hashOf(value: unknown, hash: Hash): Promise<string | null>
 // had; started is the list's create_time as each path has always read it.
 // metadata is the list's allow-listed keys, each in its form (ListItem.meta),
 // and the hashes of the title and the project's ids.
-export async function buildSummaryRecord(item: ListItem, hash: Hash): Promise<Record<string, unknown>> {
+export async function buildSummaryRecord(item: ListItem, hash: Hash, format: number): Promise<Record<string, unknown>> {
   const ended = uploadTime(item);
   const [titleHash, gizmoIdHash, templateIdHash] = await Promise.all([hashOf(item.title, hash), hashOf(item.gizmoId, hash), hashOf(item.templateId, hash)]);
   const { create_time, update_time, is_archived, is_starred, pinned_time, is_temporary_chat, is_do_not_remember, memory_scope, async_status } = item.meta;
@@ -54,7 +53,7 @@ export async function buildSummaryRecord(item: ListItem, hash: Hash): Promise<Re
     name: NAME,
     platform: PLATFORM,
     identifier: item.id,
-    format_version: FORMAT_VERSION,
+    format_version: format,
     is_summary: true,
     date: ended.timestamp(),
     ...(item.started === null ? {} : { started: item.started }),
@@ -93,7 +92,7 @@ const userAgentOf = (mapping: Readonly<Record<string, unknown>>): string => (Obj
 // when there is no started. turns and turns_complete are the parse's.
 // metadata holds the conversation's content-free keys, each in its form,
 // the hashes, and the skeleton.
-export async function buildDetailRecord(json: unknown, item: ListItem, hash: Hash): Promise<Record<string, unknown> | null> {
+export async function buildDetailRecord(json: unknown, item: ListItem, hash: Hash, format: number): Promise<Record<string, unknown> | null> {
   const mapping = field(json, 'mapping');
   if (!isObject(json) || !isObject(mapping)) {
     return null;
@@ -119,7 +118,7 @@ export async function buildDetailRecord(json: unknown, item: ListItem, hash: Has
     name: NAME,
     platform: PLATFORM,
     identifier: item.id,
-    format_version: FORMAT_VERSION,
+    format_version: format,
     is_summary: false,
     date: (started ?? ended).timestamp(),
     ...(started === null ? {} : { started }),

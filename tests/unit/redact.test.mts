@@ -21,7 +21,7 @@ type Json = Record<string, unknown>;
 const hash: Hash = async (text) => createHash('sha256').update(text).digest('hex');
 const chatId = (n: number) => `6911f0a5-2222-8000-8000-${String(n).padStart(12, '0')}`;
 const plain = (value: unknown): Json => JSON.parse(JSON.stringify(value)) as Json;
-const redact = (event: unknown): Json => redactChatGPT(event as Json);
+const redact = (event: unknown): Json => redactChatGPT(event as Json, 1);
 
 // What the extension uploads: rex-content-processing walks the processor's
 // output and copies each object's own keys into a plain one, so a DateString
@@ -86,7 +86,7 @@ const smallChat = () => detail(tree(
 
 const [MAIN_ITEM] = await listed({ main: [listItem(CHAT_ID)] });
 async function detailOf(chat: unknown): Promise<Json> {
-  const record = await buildDetailRecord(chat, MAIN_ITEM, hash);
+  const record = await buildDetailRecord(chat, MAIN_ITEM, hash, 1);
   assert.ok(record !== null, 'Test setup invalid: the builder gave no record');
   return record;
 }
@@ -131,7 +131,7 @@ async function fixtureRecords(): Promise<Array<[string, Json]>> {
     starred: [listItem(chatId(6), { is_starred: true, pinned_time: LIST_CREATED })],
     project: [projectItem(chatId(2))],
   });
-  const summaries = await Promise.all(items.map(async (item): Promise<[string, Json]> => [`summary from the ${item.source} list, ${item.id}`, await buildSummaryRecord(item, hash)]));
+  const summaries = await Promise.all(items.map(async (item): Promise<[string, Json]> => [`summary from the ${item.source} list, ${item.id}`, await buildSummaryRecord(item, hash, 1)]));
   const details = await Promise.all(CHATS.map(async ([what, chat]): Promise<[string, Json]> => [`detail: ${what}`, await detailOf(chat())]));
   return [...summaries, ...details];
 }
@@ -230,6 +230,32 @@ test('a point that is not a format 1 record the builders make keeps only the sca
   // Every case runs before the test fails, so one break shows each case it lets through.
   const wrong = cases.filter(([, event, expected]) => !isDeepStrictEqual(redact(event), expected)).map(([what]) => what);
   assert.deepEqual(wrong, []);
+});
+
+test('the case keeps a record of the format it is given, and cuts a record of any other format to the scaffold', () => {
+  for (const [what, record] of RECORDS) {
+    // What the builders make under format 2 (record.test.mts).
+    const formatTwo: Json = { ...record, format_version: 2 };
+    const scaffold = { date: record.date, name: 'rex-conversation', platform: 'chatgpt', identifier: record.identifier };
+    const kept = redactChatGPT(formatTwo, 2);
+    assert.deepEqual(plain(kept), plain(formatTwo), `${what}: format 2 under 2`);
+    assert.deepEqual([Object.keys(kept).sort(), kept.turns, kept.metadata], [Object.keys(formatTwo).sort(), formatTwo.turns, formatTwo.metadata], `${what}: keys`);
+    assert.deepEqual(redactChatGPT(record, 2), scaffold, `${what}: format 1 under 2`);
+    assert.deepEqual(redactChatGPT(formatTwo, 1), scaffold, `${what}: format 2 under 1`);
+    assert.deepEqual(redactChatGPT({ ...record, format_version: 3 }, 2), scaffold, `${what}: format 3 under 2`);
+  }
+});
+
+test('a format that is not an integer matches nothing, not even a record that has no format_version or the same value', () => {
+  const scaffold = { date: SUMMARY.date, name: 'rex-conversation', platform: 'chatgpt', identifier: CHAT_ID };
+  for (const format of [undefined, null, NaN, 1.5, '1', '2']) {
+    const given = format as unknown as number;
+    assert.deepEqual(redactChatGPT({ ...SUMMARY, format_version: format }, given), scaffold, String(format));
+    assert.deepEqual(redactChatGPT({ ...DETAIL, format_version: format }, given), { ...scaffold, date: DETAIL.date }, String(format));
+  }
+  const { format_version: dropped, ...unversioned } = SUMMARY;
+  assert.equal(dropped, 1, 'Test setup invalid: the fixture summary is not format 1');
+  assert.deepEqual(redactChatGPT(unversioned, undefined as unknown as number), scaffold);
 });
 
 test('the scaffold keeps each field only in its form, and the PDK envelope keys as they come', () => {
@@ -621,12 +647,12 @@ test('2,000 seeded departures of the raw chats and list items: every record the 
       what = `departure ${n} of ${name}`;
       const raw = departRaw(chat(), random);
       assert.deepEqual(mappingOf(raw.mapping), skeletonUnderIdRule(raw.mapping), `${what}: its raw tree in the mapping`);
-      record = await buildDetailRecord(raw, MAIN_ITEM, hash);
+      record = await buildDetailRecord(raw, MAIN_ITEM, hash, 1);
     } else {
       const [list, item] = lists[Math.floor(random() * lists.length)];
       what = `departure ${n} of a ${list} list item`;
       const [listedItem] = (await walk({ [list]: [departRaw(item(), random)] })).items;
-      record = listedItem === undefined ? null : await buildSummaryRecord(listedItem, hash);
+      record = listedItem === undefined ? null : await buildSummaryRecord(listedItem, hash, 1);
     }
     if (record === null) {
       tally.none += 1;
